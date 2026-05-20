@@ -12,7 +12,7 @@
 > - **[`fix/stale-token-refresh`](https://github.com/MankhongGarden/claude-quota-tray/tree/fix/stale-token-refresh)** — single bug fix proposed back to upstream as [PR #4](https://github.com/kpcrmv4/claude-quota-tray/pull/4)
 > - **`local-enhancements`** — personal feature stack (see "Fork additions" below);
 >   not yet proposed upstream — waiting for author engagement on the open issues
->   ([#1](https://github.com/kpcrmv4/claude-quota-tray/issues/1) · [#3](https://github.com/kpcrmv4/claude-quota-tray/issues/3))
+>   ([#1](https://github.com/kpcrmv4/claude-quota-tray/issues/1) · [#3](https://github.com/kpcrmv4/claude-quota-tray/issues/3) · [#5](https://github.com/kpcrmv4/claude-quota-tray/issues/5))
 >   before drip-feeding individual PRs.
 >
 > License stays MIT — same as upstream. Original `LICENSE` file preserved unchanged.
@@ -22,18 +22,22 @@
 1. **Stale-token survival** — re-read OAuth credentials on 401/403 so the tray
    doesn't silently die after Claude Code rotates the access token
    ([PR #4](https://github.com/kpcrmv4/claude-quota-tray/pull/4))
-2. **`CQT_DATA_DIR` env override** — run two instances side-by-side with
+2. **Single-Tk-root refactor + heartbeat watchdog** — one `tk.Tk()` per process
+   on the main thread, popups as `Toplevel(root)`, pystray on a worker thread.
+   Kills the silent `Tcl_Panic` in `tcl86t.dll` that the prior worker-thread
+   `tk.Tk()` design eventually triggered (per [#5](https://github.com/kpcrmv4/claude-quota-tray/issues/5)).
+   Bundled `watchdog.ps1` + Scheduled Task auto-restart any tray whose
+   heartbeat goes stale.
+3. **`CQT_DATA_DIR` env override** — run two instances side-by-side with
    independent settings (per [#1](https://github.com/kpcrmv4/claude-quota-tray/issues/1))
-3. **`CQT_DUAL_ICON=1` single-process dual-icon** — one process, two tray
+4. **`CQT_DUAL_ICON=1` single-process dual-icon** — one process, two tray
    icons (5h frame · Weekly donut), shared poll loop
-4. **ETA-based alert** — toast when `state.burn.eta_seconds` projects 100%
+5. **ETA-based alert** — toast when `state.burn.eta_seconds` projects 100%
    within configurable window (default 60 min)
-5. **Sparkline in tooltip** — 24h Unicode trend bar (`▁▂▃▅▆█`) of the headline
+6. **Sparkline in tooltip** — 24h Unicode trend bar (`▁▂▃▅▆█`) of the headline
    metric, glanceable on hover
-6. **`ccusage` cost integration** — today's USD spend rendered alongside the
+7. **`ccusage` cost integration** — today's USD spend rendered alongside the
    `%`, refreshed in a background thread to avoid blocking the UI
-7. **Cross-account aggregation** — `aggregate_accounts: true` polls every
-   configured account each cycle, surfaces each in the right-click menu
 8. **Active-window attribution** — opt-in; samples Win32 foreground window
    on poll, attributes session-pct deltas, surfaces top 3 in last hour
 9. **Auto-pause on battery** — skip polls (and API calls) when laptop is
