@@ -53,7 +53,6 @@ def _defaults() -> Dict[str, Any]:
         "show_cost": True,  # show today's $ from ccusage in popup + menu
         "show_sparkline": True,  # render Unicode trend bar in tooltip
         "attribute_active_window": False,  # sample Win32 foreground window per poll
-        "aggregate_accounts": False,  # poll all configured accounts each cycle, not just active
     }
 
 

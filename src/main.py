@@ -59,9 +59,6 @@ class AppState:
         self.paused_by_schedule = False
         self.paused_by_battery = False
         self.fired_eta = {"session": False, "weekly": False}
-        # Per-account snapshots when aggregate_accounts is enabled.
-        # Maps account_id -> dict(name=str, plan=str, snapshot=UsageSnapshot).
-        self.aggregate: dict = {}
 
     @property
     def headline_pct(self) -> Optional[int]:
@@ -156,40 +153,6 @@ def _on_battery() -> bool:
         return False
 
 
-def _poll_all_accounts() -> None:
-    """When aggregate_accounts is enabled, fetch usage for every configured
-    account (including non-active ones). Writes into state.aggregate."""
-    if not bool(user_settings.get("aggregate_accounts", False)):
-        state.aggregate = {}
-        return
-    new_agg: dict = {}
-    for acct in accounts.list_accounts():
-        try:
-            creds = accounts.get_credentials(acct)
-            tok = creds["token"]
-        except Exception:
-            continue
-        snap = fetch_usage(tok, model=config.MODEL)
-        # Same stale-token retry as the active account
-        if snap.status_code in (401, 403) and not snap.has_data:
-            try:
-                creds = accounts.get_credentials(acct)
-                tok = creds["token"]
-                snap = fetch_usage(tok, model=config.MODEL)
-            except Exception:
-                pass
-        new_agg[acct["id"]] = {
-            "name": acct.get("name", "Account"),
-            "plan": creds.get("plan") if isinstance(creds, dict) else None,
-            "snapshot": snap,
-        }
-        try:
-            history.record(acct["id"], snap)
-        except Exception:
-            pass
-    state.aggregate = new_agg
-
-
 def _load_active_token() -> None:
     """Resolve the active account, token, and plan info."""
     try:
@@ -272,7 +235,6 @@ def _poll_loop_inner(icon: pystray.Icon):
                 state.burn = history.burn_rate(60, acct_id)
                 _check_notifications(icon, snapshot)
                 _sample_active_window(snapshot)
-                _poll_all_accounts()
             _refresh_all_icons()
 
         _maybe_prune()
@@ -744,10 +706,17 @@ def action_toggle_schedule(icon, item):
 
 def _make_bool_toggle(key: str, default: bool = True):
     def _do(icon, item):
-        cur = bool(user_settings.get(key, default))
-        user_settings.update(**{key: not cur})
-        state.force_refresh.set()
-        _refresh_icon(icon)
+        try:
+            cur = bool(user_settings.get(key, default))
+            user_settings.update(**{key: not cur})
+            state.force_refresh.set()
+            # Defer menu rebuild slightly — touching icon.menu from inside a
+            # Win32 menu-callback while the menu is still on screen has been
+            # observed to kill the message loop on some Win11 builds.
+            # force_refresh.set() above already triggers the poll thread to
+            # re-render once the menu closes; don't double up here.
+        except Exception:
+            _log_action_error(f"toggle:{key}")
     return _do
 
 
@@ -755,7 +724,6 @@ action_toggle_battery_pause = _make_bool_toggle("pause_on_battery", True)
 action_toggle_sparkline = _make_bool_toggle("show_sparkline", True)
 action_toggle_cost = _make_bool_toggle("show_cost", True)
 action_toggle_window_attribution = _make_bool_toggle("attribute_active_window", False)
-action_toggle_aggregate = _make_bool_toggle("aggregate_accounts", False)
 
 
 # --- Menu construction ----------------------------------------------------
@@ -790,24 +758,6 @@ def build_menu(metric: str = "session"):
             None,
             enabled=False,
             visible=lambda item: bool(_menu_cost_text()),
-        ),
-        pystray.MenuItem(
-            lambda item: _menu_aggregate_text(0),
-            None,
-            enabled=False,
-            visible=lambda item: bool(_menu_aggregate_text(0)),
-        ),
-        pystray.MenuItem(
-            lambda item: _menu_aggregate_text(1),
-            None,
-            enabled=False,
-            visible=lambda item: bool(_menu_aggregate_text(1)),
-        ),
-        pystray.MenuItem(
-            lambda item: _menu_aggregate_text(2),
-            None,
-            enabled=False,
-            visible=lambda item: bool(_menu_aggregate_text(2)),
         ),
         pystray.MenuItem(
             lambda item: _menu_attribution_text(),
@@ -977,11 +927,6 @@ def _build_settings_menu():
             action_toggle_window_attribution,
             checked=lambda item: bool(user_settings.get("attribute_active_window", False)),
         ),
-        pystray.MenuItem(
-            t('menu.aggregate_accounts'),
-            action_toggle_aggregate,
-            checked=lambda item: bool(user_settings.get("aggregate_accounts", False)),
-        ),
         pystray.MenuItem(t('menu.icon_theme'), pystray.Menu(*theme_items)),
         pystray.MenuItem(t('menu.icon_style'), pystray.Menu(*style_items)),
         pystray.MenuItem(t('menu.poll_interval'),
@@ -1076,31 +1021,6 @@ def _menu_attribution_text() -> str:
         return ""
     bits = [f"{title} +{delta}%" for title, delta in rows]
     return "🪟 1h: " + " · ".join(bits)
-
-
-def _menu_aggregate_lines() -> list[str]:
-    """One line per non-active account when aggregate mode is on."""
-    if not bool(user_settings.get("aggregate_accounts", False)):
-        return []
-    active_id = state.active_account["id"] if state.active_account else None
-    out = []
-    for aid, info in state.aggregate.items():
-        if aid == active_id:
-            continue  # active account already shown in main rows
-        snap = info.get("snapshot")
-        if snap is None or not snap.ok or not snap.has_data:
-            continue
-        s = snap.session_pct if snap.session_pct is not None else "—"
-        w = snap.weekly_pct if snap.weekly_pct is not None else "—"
-        out.append(f"• {info['name']}: 5h {s}% · Wk {w}%")
-    return out
-
-
-def _menu_aggregate_text(slot: int) -> str:
-    lines = _menu_aggregate_lines()
-    if slot >= len(lines):
-        return ""
-    return lines[slot]
 
 
 # --- Entry point ----------------------------------------------------------
