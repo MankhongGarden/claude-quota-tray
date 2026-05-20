@@ -1,17 +1,21 @@
 """
 Full history window: 2 progress bars on top + 24-hour usage chart.
 Uses shared widgets from bar_widget.py.
+
+Runs as a ``Toplevel`` of the process-wide Tk root managed by
+``tk_host``. See ``tk_host`` for the rationale behind the centralised
+Tk lifecycle.
 """
 
 from __future__ import annotations
 
-import threading
 import time
 import tkinter as tk
 from datetime import datetime
 from typing import Callable, Optional
 
 import history
+import tk_host
 from bar_widget import (
     BG, BTN_BG, BTN_BG_ACTIVE, MUTED, TEXT,
     apply_bar, build_bar, format_burn, ui_font,
@@ -19,8 +23,7 @@ from bar_widget import (
 from i18n import t
 
 
-_window_lock = threading.Lock()
-_open_window: Optional[tk.Tk] = None
+_open_window: Optional[tk.Toplevel] = None
 
 SnapshotFetcher = Callable[[], dict]
 
@@ -28,15 +31,8 @@ SnapshotFetcher = Callable[[], dict]
 def show(account_id: str, account_name: str,
          get_data: Optional[SnapshotFetcher] = None,
          burn: Optional[dict] = None) -> None:
-    with _window_lock:
-        global _open_window
-        if _open_window is not None:
-            try:
-                _open_window.lift()
-                _open_window.focus_force()
-                return
-            except tk.TclError:
-                _open_window = None
+    if not tk_host.is_ready():
+        return
 
     if get_data is None:
         b = burn or {"session": {}, "weekly": {}}
@@ -46,28 +42,29 @@ def show(account_id: str, account_name: str,
             "burn": b,
         }
 
-    t = threading.Thread(
-        target=_run_window,
-        args=(account_id, account_name, get_data),
-        daemon=True,
-    )
-    t.start()
+    tk_host.spawn(lambda root: _build(root, account_id, account_name, get_data))
 
 
-def _run_window(account_id: str, account_name: str,
-                get_data: SnapshotFetcher) -> None:
+def _build(root: tk.Tk, account_id: str, account_name: str,
+           get_data: SnapshotFetcher) -> None:
     global _open_window
+    if _open_window is not None:
+        try:
+            _open_window.lift()
+            _open_window.focus_force()
+            return
+        except tk.TclError:
+            _open_window = None
 
-    root = tk.Tk()
-    root.title(t('window.history_title', name=account_name))
-    root.geometry("760x560")
-    root.minsize(560, 420)
-    root.configure(bg=BG)
+    win = tk.Toplevel(root)
+    win.title(t('window.history_title', name=account_name))
+    win.geometry("760x560")
+    win.minsize(560, 420)
+    win.configure(bg=BG)
 
-    with _window_lock:
-        _open_window = root
+    _open_window = win
 
-    header = tk.Frame(root, bg=BG)
+    header = tk.Frame(win, bg=BG)
     header.pack(fill="x", padx=18, pady=(16, 0))
     title_box = tk.Frame(header, bg=BG)
     title_box.pack(side="left")
@@ -87,7 +84,7 @@ def _run_window(account_id: str, account_name: str,
     )
     burn_lbl.pack(side="right")
 
-    bars_panel = tk.Frame(root, bg=BG)
+    bars_panel = tk.Frame(win, bg=BG)
     bars_panel.pack(fill="x", padx=18, pady=(10, 6))
 
     session_bar = build_bar(bars_panel, t('bar.session_label'))
@@ -96,15 +93,15 @@ def _run_window(account_id: str, account_name: str,
     weekly_bar["frame"].pack(fill="x")
 
     tk.Label(
-        root, text=t('window.last_24h'),
+        win, text=t('window.last_24h'),
         font=ui_font(11, "bold"),
         fg=TEXT, bg=BG,
     ).pack(anchor="w", padx=18, pady=(14, 2))
 
-    canvas = tk.Canvas(root, bg=BG, highlightthickness=0)
+    canvas = tk.Canvas(win, bg=BG, highlightthickness=0)
     canvas.pack(fill="both", expand=True, padx=18, pady=(2, 8))
 
-    footer = tk.Frame(root, bg=BG)
+    footer = tk.Frame(win, bg=BG)
     footer.pack(fill="x", padx=18, pady=(0, 14))
     _legend_swatch(footer, "#4ade80", t('bar.session_short'))
     _legend_swatch(footer, "#60a5fa", t('bar.weekly_short'))
@@ -128,25 +125,29 @@ def _run_window(account_id: str, account_name: str,
     refresh_btn.pack(side="right")
 
     canvas.bind("<Configure>", lambda _e: _redraw_chart(canvas, account_id))
-    root.after(50, _refresh_all)
+    win.after(50, _refresh_all)
 
     def _auto():
+        if not win.winfo_exists():
+            return
         try:
             _refresh_all()
         except tk.TclError:
             return
-        root.after(30_000, _auto)
+        win.after(30_000, _auto)
 
-    root.after(30_000, _auto)
+    win.after(30_000, _auto)
 
     def on_close():
         global _open_window
-        with _window_lock:
+        if _open_window is win:
             _open_window = None
-        root.destroy()
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
 
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.mainloop()
+    win.protocol("WM_DELETE_WINDOW", on_close)
 
 
 def _legend_swatch(parent: tk.Frame, color: str, label: str) -> None:

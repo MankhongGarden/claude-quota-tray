@@ -30,6 +30,7 @@ import accounts
 import history_window
 import status_window
 import settings_dialogs
+import tk_host
 from i18n import LANGUAGES, set_language, t
 from bar_widget import color_emoji, unicode_bar
 from api_client import fetch_usage, format_reset, UsageSnapshot
@@ -536,7 +537,12 @@ def action_show_error(icon, item):
 def action_quit(icon, item):
     state.stop.set()
     state.force_refresh.set()
-    icon.stop()
+    for ic in ICONS:
+        try:
+            ic.stop()
+        except Exception:
+            pass
+    tk_host.stop()
 
 
 def action_open_repo(icon, item):
@@ -666,10 +672,12 @@ def _restart_app(icon) -> None:
     time.sleep(0.6)
     state.stop.set()
     state.force_refresh.set()
-    try:
-        icon.stop()
-    except Exception:
-        pass
+    for ic in ICONS:
+        try:
+            ic.stop()
+        except Exception:
+            pass
+    tk_host.stop()
 
 
 def _make_set_language(code: str):
@@ -1042,6 +1050,34 @@ def _redirect_stderr_to_log() -> None:
         pass
 
 
+def _start_heartbeat_thread() -> None:
+    """Touch a heartbeat file every 30s so an external watchdog can tell
+    whether this tray instance is still alive.
+
+    A PID file would be simpler, but the Microsoft-Store Python install
+    runs the interpreter inside an App Container, so ``os.getpid()``
+    returns a container-internal PID that the host's process table can
+    never see. Heartbeat-file mtime sidesteps the PID-namespace mismatch
+    entirely.
+    """
+    def _beat():
+        hb = user_settings.SETTINGS_DIR / "tray.heartbeat"
+        try:
+            hb.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        while not state.stop.is_set():
+            try:
+                hb.touch(exist_ok=True)
+                _os = __import__("os")
+                _os.utime(hb, None)
+            except Exception:
+                pass
+            state.stop.wait(timeout=30)
+
+    threading.Thread(target=_beat, daemon=True).start()
+
+
 def _make_icon(app_id: str, metric: str, style: Optional[str]) -> pystray.Icon:
     icon = pystray.Icon(
         app_id,
@@ -1062,32 +1098,47 @@ def main():
 
     try:
         user_settings.load()
+        _start_heartbeat_thread()
         notifications.init(config.APP_NAME)
+
+        # Tk owns the main thread. Create the hidden root BEFORE pystray
+        # starts so any early popup request from the poller has somewhere
+        # to land. See tk_host.py for why this matters (Tcl interpreter
+        # thread-affinity invariant; creating tk.Tk() on a worker thread
+        # eventually triggers a hard Tcl_Panic inside tcl86t.dll).
+        tk_host.ensure()
 
         dual = _os.environ.get("CQT_DUAL_ICON", "").lower() in ("1", "true", "yes")
 
         if dual:
-            # Single process, two icons — one for 5h (frame), one for weekly (donut).
-            # The weekly icon runs in a daemon thread; the 5h icon owns the
-            # main-thread Win32 message loop.
+            # Single process, two icons — 5h (frame) + weekly (donut).
+            # Both pystray Icons run on their own daemon threads; Tk owns
+            # the main thread.
             ic_session = _make_icon(config.APP_ID, "session", "frame")
             ic_weekly = _make_icon(config.APP_ID + "Weekly", "weekly", "donut")
             ICONS.append(ic_session)
             ICONS.append(ic_weekly)
+            threading.Thread(target=ic_session.run, daemon=True).start()
             threading.Thread(target=ic_weekly.run, daemon=True).start()
-            poller = threading.Thread(target=poll_loop, args=(ic_session,), daemon=True)
-            poller.start()
-            ic_session.run()
+            threading.Thread(
+                target=poll_loop, args=(ic_session,), daemon=True,
+            ).start()
         else:
             metric = user_settings.get("headline_metric", "session")
             ic = _make_icon(config.APP_ID, metric, None)
             ICONS.append(ic)
-            poller = threading.Thread(target=poll_loop, args=(ic,), daemon=True)
-            poller.start()
-            ic.run()
+            threading.Thread(target=ic.run, daemon=True).start()
+            threading.Thread(
+                target=poll_loop, args=(ic,), daemon=True,
+            ).start()
+
+        # Block main thread on Tk mainloop until action_quit / _restart_app
+        # schedules root.quit() via tk_host.stop().
+        tk_host.run()
+
         try:
             sys.stderr.write(
-                f"=== icon.run() returned cleanly "
+                f"=== tk_host.run() returned cleanly "
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
             )
         except Exception:

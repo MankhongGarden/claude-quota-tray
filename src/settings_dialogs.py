@@ -1,21 +1,24 @@
 """
 Tkinter dialogs for editing user settings that don't fit in a tray
-sub-menu (accounts, custom thresholds, schedule). Each dialog is opened
-on its own thread so the tray icon stays responsive.
+sub-menu (accounts, custom thresholds, schedule).
 
-A simple `on_saved` callback is invoked after each successful save so the
-caller can refresh menus / force a poll.
+Each dialog runs as a ``Toplevel`` of the process-wide Tk root managed
+by ``tk_host`` — never on its own thread, never as a fresh ``tk.Tk()``.
+See ``tk_host`` for the rationale.
+
+A simple `on_saved` callback is invoked after each successful save so
+the caller can refresh menus / force a poll.
 """
 
 from __future__ import annotations
 
-import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from typing import Callable, Optional
 
 import accounts
 import settings as user_settings
+import tk_host
 from bar_widget import ui_font
 from i18n import t
 
@@ -28,13 +31,15 @@ _BTN_BG = "#2d2d2d"
 _BTN_BG_ACTIVE = "#3a3a3a"
 _ENTRY_BG = "#262626"
 
-_dialog_lock = threading.Lock()
-_open_dialogs: dict[str, tk.Tk] = {}
+_open_dialogs: dict[str, tk.Toplevel] = {}
 
 
-def _spawn(kind: str, builder: Callable[[tk.Tk], None]) -> None:
-    """Run a Tk dialog on its own thread and dedupe by kind."""
-    with _dialog_lock:
+def _spawn(kind: str, builder: Callable[[tk.Toplevel], None]) -> None:
+    """Schedule a dialog on the Tk thread, deduped by kind."""
+    if not tk_host.is_ready():
+        return
+
+    def _on_tk_thread(root: tk.Tk) -> None:
         existing = _open_dialogs.get(kind)
         if existing is not None:
             try:
@@ -44,25 +49,21 @@ def _spawn(kind: str, builder: Callable[[tk.Tk], None]) -> None:
             except tk.TclError:
                 _open_dialogs.pop(kind, None)
 
-    def _worker():
-        root = tk.Tk()
-        root.configure(bg=_BG)
-        with _dialog_lock:
-            _open_dialogs[kind] = root
+        dlg = tk.Toplevel(root)
+        dlg.configure(bg=_BG)
+        _open_dialogs[kind] = dlg
 
         def _on_close():
-            with _dialog_lock:
-                _open_dialogs.pop(kind, None)
+            _open_dialogs.pop(kind, None)
             try:
-                root.destroy()
+                dlg.destroy()
             except tk.TclError:
                 pass
 
-        root.protocol("WM_DELETE_WINDOW", _on_close)
-        builder(root)
-        root.mainloop()
+        dlg.protocol("WM_DELETE_WINDOW", _on_close)
+        builder(dlg)
 
-    threading.Thread(target=_worker, daemon=True).start()
+    tk_host.spawn(_on_tk_thread)
 
 
 def _styled_button(parent, text, command, *, primary=False):
@@ -101,7 +102,7 @@ def open_accounts(on_saved: Callable[[], None]) -> None:
     _spawn("accounts", lambda root: _build_accounts(root, on_saved))
 
 
-def _build_accounts(root: tk.Tk, on_saved: Callable[[], None]) -> None:
+def _build_accounts(root: tk.Toplevel, on_saved: Callable[[], None]) -> None:
     root.title(t('dialog.accounts_title'))
     root.geometry("560x420")
 
@@ -197,7 +198,7 @@ def _build_accounts(root: tk.Tk, on_saved: Callable[[], None]) -> None:
     _styled_button(btn_row, t('common.close'), root.destroy).pack(side="right")
 
 
-def _open_add_account(parent: tk.Tk, on_added: Callable[[], None],
+def _open_add_account(parent: tk.Toplevel, on_added: Callable[[], None],
                       on_saved: Callable[[], None]) -> None:
     dlg = tk.Toplevel(parent)
     dlg.title(t('dialog.accounts_add_title'))
@@ -266,7 +267,7 @@ def _open_add_account(parent: tk.Tk, on_added: Callable[[], None],
         side="right", padx=(0, 8))
 
 
-def _prompt_string(parent: tk.Tk, title: str, label: str,
+def _prompt_string(parent: tk.Toplevel, title: str, label: str,
                    initial: str = "") -> Optional[str]:
     dlg = tk.Toplevel(parent)
     dlg.title(title)
@@ -311,7 +312,7 @@ def open_schedule(on_saved: Callable[[], None]) -> None:
     _spawn("schedule", lambda root: _build_schedule(root, on_saved))
 
 
-def _build_schedule(root: tk.Tk, on_saved: Callable[[], None]) -> None:
+def _build_schedule(root: tk.Toplevel, on_saved: Callable[[], None]) -> None:
     root.title(t('dialog.schedule_title'))
     root.geometry("440x360")
 
@@ -396,7 +397,7 @@ def open_thresholds(on_saved: Callable[[], None]) -> None:
     _spawn("thresholds", lambda root: _build_thresholds(root, on_saved))
 
 
-def _build_thresholds(root: tk.Tk, on_saved: Callable[[], None]) -> None:
+def _build_thresholds(root: tk.Toplevel, on_saved: Callable[[], None]) -> None:
     root.title(t('dialog.thresholds_title'))
     root.geometry("420x260")
 

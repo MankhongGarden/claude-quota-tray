@@ -3,17 +3,20 @@ Compact status popup shown on left-click of the tray icon.
 
 Just the two progress bars and the burn-rate summary — no chart.
 Auto-refreshes every 5 seconds while open.
+
+Runs as a ``Toplevel`` of the process-wide Tk root managed by
+``tk_host``. Never creates ``tk.Tk()`` directly — see ``tk_host`` for
+the rationale (Tcl/Tk interpreter thread-affinity invariant).
 """
 
 from __future__ import annotations
 
-import threading
 import time
 import tkinter as tk
 import traceback
-from pathlib import Path
 from typing import Callable, Optional
 
+import tk_host
 from bar_widget import (
     BG, BTN_BG, BTN_BG_ACTIVE, MUTED, TEXT,
     apply_bar, build_bar, format_burn, ui_font,
@@ -22,9 +25,7 @@ from i18n import t
 import settings as user_settings
 
 
-_window_lock = threading.Lock()
-_open_window: Optional[tk.Tk] = None
-_spawn_result: dict = {"ok": False}
+_open_window: Optional[tk.Toplevel] = None
 
 SnapshotFetcher = Callable[[], dict]
 
@@ -43,33 +44,57 @@ def _log_error(where: str) -> None:
 
 
 def show(account_name: str, get_data: SnapshotFetcher) -> bool:
+    """Schedule the compact status popup to open on the Tk thread.
+
+    Returns True if the request was scheduled (Tk host alive). The
+    actual window will appear on the next Tk idle tick.
     """
-    Open (or focus) the compact status popup.
-    Returns True if the spawn succeeded (Tk initialised), False on failure
-    so the caller can fall back to another window.
-    """
+    if not tk_host.is_ready():
+        return False
+    tk_host.spawn(lambda root: _build(root, account_name, get_data))
+    return True
+
+
+def _build(root: tk.Tk, account_name: str, get_data: SnapshotFetcher) -> None:
     global _open_window
-    with _window_lock:
-        if _open_window is not None:
-            try:
-                _open_window.after(0, lambda w=_open_window: _bring_to_front(w))
-                return True
-            except tk.TclError:
-                _open_window = None
+    if _open_window is not None:
+        try:
+            _bring_to_front(_open_window)
+            return
+        except tk.TclError:
+            _open_window = None
 
-    _spawn_result["ok"] = False
-    ready = threading.Event()
-    threading.Thread(
-        target=_run, args=(account_name, get_data, ready),
-        daemon=True,
-    ).start()
-    # Give the worker a brief window to init Tk; if it failed quickly we
-    # learn here and can fall back.
-    ready.wait(timeout=2.0)
-    return bool(_spawn_result["ok"])
+    try:
+        win = tk.Toplevel(root)
+    except Exception:
+        _log_error("toplevel_create")
+        return
+
+    win.title(t('window.status_title', name=account_name))
+    win.configure(bg=BG)
+    win.minsize(360, 240)
+
+    w, h = 420, 300
+    try:
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        x = max(0, sw - w - 32)
+        y = max(0, sh - h - 80)
+    except tk.TclError:
+        x, y = 100, 100
+    win.geometry(f"{w}x{h}+{x}+{y}")
+
+    try:
+        win.attributes("-topmost", True)
+        win.after(400, lambda: _safe_set_topmost(win, False))
+    except tk.TclError:
+        pass
+
+    _open_window = win
+    _build_widgets(win, account_name, get_data)
 
 
-def _bring_to_front(win: tk.Tk) -> None:
+def _bring_to_front(win: tk.Toplevel) -> None:
     try:
         win.deiconify()
         win.lift()
@@ -80,58 +105,9 @@ def _bring_to_front(win: tk.Tk) -> None:
         pass
 
 
-def _run(account_name: str, get_data: SnapshotFetcher,
-         ready: threading.Event) -> None:
-    global _open_window
-    root: Optional[tk.Tk] = None
-    try:
-        root = tk.Tk()
-        root.title(t('window.status_title', name=account_name))
-        root.configure(bg=BG)
-        root.minsize(360, 240)
-
-        w, h = 420, 300
-        try:
-            sw = root.winfo_screenwidth()
-            sh = root.winfo_screenheight()
-            x = max(0, sw - w - 32)
-            y = max(0, sh - h - 80)
-        except tk.TclError:
-            x, y = 100, 100
-        root.geometry(f"{w}x{h}+{x}+{y}")
-
-        try:
-            root.attributes("-topmost", True)
-            root.after(400, lambda: _safe_set_topmost(root, False))
-        except tk.TclError:
-            pass
-
-        with _window_lock:
-            _open_window = root
-
-        _build_widgets(root, account_name, get_data)
-
-        _spawn_result["ok"] = True
-        ready.set()
-        root.mainloop()
-    except Exception:
-        _log_error("init")
-        _spawn_result["ok"] = False
-        ready.set()
-        try:
-            if root is not None:
-                root.destroy()
-        except Exception:
-            pass
-    finally:
-        with _window_lock:
-            if _open_window is root:
-                _open_window = None
-
-
-def _build_widgets(root: tk.Tk, account_name: str,
+def _build_widgets(win: tk.Toplevel, account_name: str,
                    get_data: SnapshotFetcher) -> None:
-    header = tk.Frame(root, bg=BG)
+    header = tk.Frame(win, bg=BG)
     header.pack(fill="x", padx=14, pady=(12, 0))
     title_box = tk.Frame(header, bg=BG)
     title_box.pack(side="left")
@@ -151,7 +127,7 @@ def _build_widgets(root: tk.Tk, account_name: str,
     )
     burn_lbl.pack(side="right")
 
-    panel = tk.Frame(root, bg=BG)
+    panel = tk.Frame(win, bg=BG)
     panel.pack(fill="x", padx=14, pady=(8, 4))
 
     session_bar = build_bar(panel, t('bar.session_label'))
@@ -159,7 +135,7 @@ def _build_widgets(root: tk.Tk, account_name: str,
     weekly_bar = build_bar(panel, t('bar.weekly_label'))
     weekly_bar["frame"].pack(fill="x")
 
-    footer = tk.Frame(root, bg=BG)
+    footer = tk.Frame(win, bg=BG)
     footer.pack(fill="x", padx=14, pady=(8, 12), side="bottom")
 
     def _refresh():
@@ -174,7 +150,7 @@ def _build_widgets(root: tk.Tk, account_name: str,
         plan_lbl.configure(text=("· " + plan) if plan else "")
 
     tk.Button(
-        footer, text=t('common.close'), command=root.destroy,
+        footer, text=t('common.close'), command=lambda: _on_close(win),
         bg=BTN_BG, fg=TEXT, relief="flat",
         activebackground=BTN_BG_ACTIVE, activeforeground=TEXT,
         padx=14, pady=4, cursor="hand2",
@@ -187,29 +163,35 @@ def _build_widgets(root: tk.Tk, account_name: str,
         padx=14, pady=4, cursor="hand2",
     ).pack(side="right", padx=(0, 8))
 
-    root.after(50, _refresh)
+    win.after(50, _refresh)
 
     def _auto():
+        if not win.winfo_exists():
+            return
         try:
             _refresh()
-            root.after(5_000, _auto)
+            win.after(5_000, _auto)
         except tk.TclError:
             return
 
-    root.after(5_000, _auto)
+    win.after(5_000, _auto)
 
-    def on_close():
-        try:
-            root.destroy()
-        except tk.TclError:
-            pass
-
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.bind("<Escape>", lambda _e: on_close())
+    win.protocol("WM_DELETE_WINDOW", lambda: _on_close(win))
+    win.bind("<Escape>", lambda _e: _on_close(win))
 
 
-def _safe_set_topmost(root: tk.Tk, value: bool) -> None:
+def _on_close(win: tk.Toplevel) -> None:
+    global _open_window
     try:
-        root.attributes("-topmost", value)
+        win.destroy()
+    except tk.TclError:
+        pass
+    if _open_window is win:
+        _open_window = None
+
+
+def _safe_set_topmost(win: tk.Toplevel, value: bool) -> None:
+    try:
+        win.attributes("-topmost", value)
     except tk.TclError:
         pass
