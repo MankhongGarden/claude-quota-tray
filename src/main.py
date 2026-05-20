@@ -20,6 +20,7 @@ from typing import Optional
 import pystray
 
 import config
+import cost
 import notifications
 import settings as user_settings
 import history
@@ -56,17 +57,28 @@ class AppState:
         self.active_account: Optional[dict] = None
         self.plan: Optional[str] = None
         self.paused_by_schedule = False
+        self.paused_by_battery = False
+        self.fired_eta = {"session": False, "weekly": False}
+        # Per-account snapshots when aggregate_accounts is enabled.
+        # Maps account_id -> dict(name=str, plan=str, snapshot=UsageSnapshot).
+        self.aggregate: dict = {}
 
     @property
     def headline_pct(self) -> Optional[int]:
-        """Number shown on the tray icon.
+        return self.headline_pct_for(user_settings.get("headline_metric", "session"))
 
-        Always the 5-hour figure because it resets in hours and is the
-        most actionable. Weekly remains visible in tooltip, popup, menu,
-        and history window.
+    def headline_pct_for(self, metric: str) -> Optional[int]:
+        """Number shown on the tray icon for a specific metric.
+
+        `metric` is "session" (5h) or "weekly" (7d). Falls back to the other
+        figure when the preferred one is missing.
         """
         if not self.snapshot or not self.snapshot.has_data:
             return None
+        if metric == "weekly":
+            if self.snapshot.weekly_pct is not None:
+                return self.snapshot.weekly_pct
+            return self.snapshot.session_pct
         if self.snapshot.session_pct is not None:
             return self.snapshot.session_pct
         return self.snapshot.weekly_pct
@@ -81,6 +93,19 @@ class AppState:
 
 
 state = AppState()
+
+# All registered tray icons (1 in single-icon mode, 2 in dual-icon mode).
+# Refreshed in lockstep after each successful poll.
+ICONS: list = []
+
+
+def _metric_for(icon) -> str:
+    """Read the per-icon metric override that was stamped at construction,
+    falling back to the user_settings default for backward compatibility."""
+    override = getattr(icon, "metric_override", None)
+    if override in ("session", "weekly"):
+        return override
+    return user_settings.get("headline_metric", "session")
 
 
 # --- Helpers --------------------------------------------------------------
@@ -116,6 +141,55 @@ def _within_schedule() -> bool:
     return h >= start or h < end
 
 
+def _on_battery() -> bool:
+    """True if the device is running on battery (not plugged in).
+    Returns False on desktops or when psutil/the battery API is unavailable."""
+    if not bool(user_settings.get("pause_on_battery", True)):
+        return False
+    try:
+        import psutil
+        bat = psutil.sensors_battery()
+        if bat is None:
+            return False
+        return not bat.power_plugged
+    except Exception:
+        return False
+
+
+def _poll_all_accounts() -> None:
+    """When aggregate_accounts is enabled, fetch usage for every configured
+    account (including non-active ones). Writes into state.aggregate."""
+    if not bool(user_settings.get("aggregate_accounts", False)):
+        state.aggregate = {}
+        return
+    new_agg: dict = {}
+    for acct in accounts.list_accounts():
+        try:
+            creds = accounts.get_credentials(acct)
+            tok = creds["token"]
+        except Exception:
+            continue
+        snap = fetch_usage(tok, model=config.MODEL)
+        # Same stale-token retry as the active account
+        if snap.status_code in (401, 403) and not snap.has_data:
+            try:
+                creds = accounts.get_credentials(acct)
+                tok = creds["token"]
+                snap = fetch_usage(tok, model=config.MODEL)
+            except Exception:
+                pass
+        new_agg[acct["id"]] = {
+            "name": acct.get("name", "Account"),
+            "plan": creds.get("plan") if isinstance(creds, dict) else None,
+            "snapshot": snap,
+        }
+        try:
+            history.record(acct["id"], snap)
+        except Exception:
+            pass
+    state.aggregate = new_agg
+
+
 def _load_active_token() -> None:
     """Resolve the active account, token, and plan info."""
     try:
@@ -149,7 +223,7 @@ def poll_loop(icon: pystray.Icon):
 
 def _poll_loop_inner(icon: pystray.Icon):
     _load_active_token()
-    _refresh_icon(icon)
+    _refresh_all_icons()
     if state.token_error and state.token is None:
         # Without a token, sit idle but keep checking — user can configure
         # an account from the menu and we'll pick it up on next iteration.
@@ -157,7 +231,7 @@ def _poll_loop_inner(icon: pystray.Icon):
             state.force_refresh.clear()
             state.force_refresh.wait(timeout=30)
             _load_active_token()
-            _refresh_icon(icon)
+            _refresh_all_icons()
             if state.token:
                 break
         if state.stop.is_set():
@@ -168,19 +242,38 @@ def _poll_loop_inner(icon: pystray.Icon):
     while not state.stop.is_set():
         if not _within_schedule():
             state.paused_by_schedule = True
-            _refresh_icon(icon)
+            state.paused_by_battery = False
+            _refresh_all_icons()
+        elif _on_battery():
+            state.paused_by_schedule = False
+            state.paused_by_battery = True
+            _refresh_all_icons()
         else:
             state.paused_by_schedule = False
+            state.paused_by_battery = False
             if state.token is None:
                 _load_active_token()
             if state.token:
                 snapshot = fetch_usage(state.token, model=config.MODEL)
+                # Stale-token guard: Claude Code rotates OAuth access tokens
+                # periodically. If our cached token was rotated out from under
+                # us, the API returns 401/403. Re-read the credentials file
+                # once and retry the poll — costs one wasted request per
+                # rotation event, but keeps the tray live across rotations
+                # without forcing the user to restart.
+                if (snapshot.status_code in (401, 403)
+                        and not snapshot.has_data):
+                    _load_active_token()
+                    if state.token:
+                        snapshot = fetch_usage(state.token, model=config.MODEL)
                 state.snapshot = snapshot
                 acct_id = state.active_account["id"] if state.active_account else "unknown"
                 history.record(acct_id, snapshot)
                 state.burn = history.burn_rate(60, acct_id)
                 _check_notifications(icon, snapshot)
-            _refresh_icon(icon)
+                _sample_active_window(snapshot)
+                _poll_all_accounts()
+            _refresh_all_icons()
 
         _maybe_prune()
         interval = int(user_settings.get("poll_interval_seconds", config.POLL_INTERVAL_SECONDS))
@@ -198,23 +291,39 @@ def _maybe_prune():
 
 
 def _refresh_icon(icon: pystray.Icon):
+    metric = _metric_for(icon)
     try:
-        icon.icon = render_icon(state.headline_pct, error=state.is_error,
+        icon.icon = render_icon(state.headline_pct_for(metric),
+                                error=state.is_error,
                                 theme=_current_theme(),
-                                style=_current_icon_style())
+                                style=_current_icon_style_for(icon))
     except Exception:
         _log_action_error("_refresh_icon:icon")
     try:
-        # Win32 caps tooltip at 128 wide chars — _build_tooltip truncates,
-        # but extra defence here in case a future caller forgets.
-        icon.title = _build_tooltip()[:_TOOLTIP_MAX]
+        icon.title = _build_tooltip(metric)[:_TOOLTIP_MAX]
     except Exception:
         _log_action_error("_refresh_icon:title")
     try:
-        icon.menu = build_menu()
+        icon.menu = build_menu(metric)
         icon.update_menu()
     except Exception:
         _log_action_error("_refresh_icon:menu")
+
+
+def _refresh_all_icons():
+    for ic in ICONS:
+        _refresh_icon(ic)
+
+
+def _current_icon_style_for(icon) -> str:
+    """Per-icon style override (so dual-icon mode can render frame for 5h
+    and donut for weekly), with fallback to the global setting."""
+    override = getattr(icon, "style_override", None)
+    if override:
+        from icon_renderer import STYLES
+        if override in STYLES:
+            return override
+    return _current_icon_style()
 
 
 # Win32 tray tooltip (NOTIFYICONDATAW.szTip) is capped at 128 wide chars
@@ -227,11 +336,41 @@ def _truncate(text: str, limit: int = _TOOLTIP_MAX) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _build_tooltip() -> str:
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values: list[int], width: int = 16) -> str:
+    """Render a list of 0-100 values as a compact Unicode bar string.
+    Empty list → empty string. Trims/right-aligns to `width` newest samples."""
+    pts = [v for v in values if v is not None]
+    if not pts:
+        return ""
+    pts = pts[-width:]
+    return "".join(_SPARK_CHARS[min(7, max(0, v * 8 // 100))] for v in pts)
+
+
+def _headline_sparkline(metric: str = "session") -> str:
+    """Sparkline of the given metric over the last 24h."""
+    if not bool(user_settings.get("show_sparkline", True)):
+        return ""
+    acct = state.active_account
+    if not acct:
+        return ""
+    idx = 2 if metric == "weekly" else 1
+    try:
+        rows = history.recent(24, acct["id"])
+    except Exception:
+        return ""
+    return _sparkline([r[idx] for r in rows], width=16)
+
+
+def _build_tooltip(metric: str = "session") -> str:
     if state.token_error:
         return _truncate(f"{config.APP_NAME}\n{t('status.token_error_tooltip')}")
     if state.paused_by_schedule:
         return _truncate(f"{config.APP_NAME}\n{t('status.paused_tooltip')}")
+    if state.paused_by_battery:
+        return _truncate(f"{config.APP_NAME}\n{t('status.battery_tooltip')}")
     snap = state.snapshot
     if snap is None:
         return _truncate(f"{config.APP_NAME}\n{t('status.fetching_tooltip')}")
@@ -241,11 +380,9 @@ def _build_tooltip() -> str:
             f"{t('status.error_tooltip', msg=snap.error or 'unknown')}"
         )
 
-    # Compact tooltip — full details live in the popup / menu.
-    # Build progressively so we can drop the lowest-priority bits if we
-    # are running out of space.
     name = state.active_account["name"] if state.active_account else config.APP_NAME
-    header = f"{name}"
+    tag = "[Week]" if metric == "weekly" else "[5h]"
+    header = f"{tag} {name}"
     if state.plan:
         header += f" · {state.plan}"
 
@@ -261,6 +398,13 @@ def _build_tooltip() -> str:
             f"→ {format_reset(snap.weekly_reset_seconds)}"
         )
 
+    spark = _headline_sparkline(metric)
+    if spark:
+        parts.append(f"24h: {spark}")
+    if bool(user_settings.get("show_cost", True)):
+        usd = cost.today_usd()
+        if usd is not None:
+            parts.append(f"Today: {cost.format_cost(usd)}")
     body = "\n".join(parts) if parts else t('status.no_headers')
     return _truncate(f"{header}\n{body}")
 
@@ -276,6 +420,18 @@ def _eta_summary() -> Optional[str]:
             bits.append(t('bar.burn_full_in', label=label,
                           rate=rate, eta=format_reset(eta)))
     return " · ".join(bits) if bits else None
+
+
+def _sample_active_window(snap: UsageSnapshot):
+    """Hook for the active-window-attribution feature. Filled in by attribution.py
+    if `attribute_active_window` setting is enabled."""
+    if not bool(user_settings.get("attribute_active_window", False)):
+        return
+    try:
+        import attribution
+        attribution.record(snap)
+    except Exception:
+        _log_action_error("attribution.record")
 
 
 def _check_notifications(icon: pystray.Icon, snap: UsageSnapshot):
@@ -304,6 +460,32 @@ def _check_notifications(icon: pystray.Icon, snap: UsageSnapshot):
                 if play_sound:
                     sound.play_alert()
 
+    # ETA-based alert — fire once when projection crosses the warning
+    # window, reset with hysteresis when projection eases off again.
+    eta_min = int(user_settings.get("eta_alert_minutes", 60))
+    if eta_min > 0:
+        warn_s = eta_min * 60
+        reset_s = warn_s * 2
+        for key, _pct, label in pairs:
+            info = state.burn.get(key, {}) or {}
+            eta = info.get("eta_seconds")
+            if eta is None:
+                state.fired_eta[key] = False
+                continue
+            if eta > reset_s:
+                state.fired_eta[key] = False
+                continue
+            if eta <= warn_s and not state.fired_eta[key]:
+                state.fired_eta[key] = True
+                notifications.notify(
+                    icon,
+                    t('toast.eta_warning_title', app=config.APP_NAME),
+                    t('toast.eta_warning_body', label=label,
+                      eta=format_reset(int(eta))),
+                )
+                if play_sound:
+                    sound.play_alert()
+
 
 # --- Menu actions ---------------------------------------------------------
 
@@ -311,9 +493,27 @@ def action_refresh(icon, item):
     state.force_refresh.set()
 
 
+def action_copy_pct(icon, item):
+    snap = state.snapshot
+    if not snap or not snap.has_data:
+        return
+    parts = []
+    if snap.session_pct is not None:
+        parts.append(f"5h {snap.session_pct}%")
+    if snap.weekly_pct is not None:
+        parts.append(f"Weekly {snap.weekly_pct}%")
+    text = " · ".join(parts)
+    try:
+        import pyperclip
+        pyperclip.copy(text)
+        notifications.notify(icon, config.APP_NAME, t('toast.copied', text=text))
+    except Exception:
+        _log_action_error("action_copy_pct")
+
+
 def _log_action_error(where: str) -> None:
     try:
-        log = Path.home() / ".claude-quota-tray" / "error.log"
+        log = user_settings.SETTINGS_DIR / "error.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "a", encoding="utf-8") as f:
             f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {where}\n")
@@ -542,12 +742,28 @@ def action_toggle_schedule(icon, item):
     _refresh_icon(icon)
 
 
+def _make_bool_toggle(key: str, default: bool = True):
+    def _do(icon, item):
+        cur = bool(user_settings.get(key, default))
+        user_settings.update(**{key: not cur})
+        state.force_refresh.set()
+        _refresh_icon(icon)
+    return _do
+
+
+action_toggle_battery_pause = _make_bool_toggle("pause_on_battery", True)
+action_toggle_sparkline = _make_bool_toggle("show_sparkline", True)
+action_toggle_cost = _make_bool_toggle("show_cost", True)
+action_toggle_window_attribution = _make_bool_toggle("attribute_active_window", False)
+action_toggle_aggregate = _make_bool_toggle("aggregate_accounts", False)
+
+
 # --- Menu construction ----------------------------------------------------
 
-def build_menu():
+def build_menu(metric: str = "session"):
     return pystray.Menu(
         pystray.MenuItem(
-            lambda item: _menu_headline_text(),
+            lambda item: _menu_headline_text(metric),
             None,
             enabled=False,
         ),
@@ -569,10 +785,43 @@ def build_menu():
             enabled=False,
             visible=lambda item: bool(_menu_burn_text()),
         ),
+        pystray.MenuItem(
+            lambda item: _menu_cost_text(),
+            None,
+            enabled=False,
+            visible=lambda item: bool(_menu_cost_text()),
+        ),
+        pystray.MenuItem(
+            lambda item: _menu_aggregate_text(0),
+            None,
+            enabled=False,
+            visible=lambda item: bool(_menu_aggregate_text(0)),
+        ),
+        pystray.MenuItem(
+            lambda item: _menu_aggregate_text(1),
+            None,
+            enabled=False,
+            visible=lambda item: bool(_menu_aggregate_text(1)),
+        ),
+        pystray.MenuItem(
+            lambda item: _menu_aggregate_text(2),
+            None,
+            enabled=False,
+            visible=lambda item: bool(_menu_aggregate_text(2)),
+        ),
+        pystray.MenuItem(
+            lambda item: _menu_attribution_text(),
+            None,
+            enabled=False,
+            visible=lambda item: bool(_menu_attribution_text()),
+        ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(t('menu.show_status'), action_show_status, default=True),
         pystray.MenuItem(t('menu.show_history'), action_show_history),
         pystray.MenuItem(t('menu.refresh_now'), action_refresh),
+        pystray.MenuItem(t('menu.copy_pct'), action_copy_pct,
+                         visible=lambda item: state.snapshot is not None
+                                 and state.snapshot.has_data),
         pystray.MenuItem(
             t('menu.show_last_error'),
             action_show_error,
@@ -708,6 +957,31 @@ def _build_settings_menu():
             ),
         ),
         pystray.MenuItem(t('menu.schedule_settings'), action_edit_schedule),
+        pystray.MenuItem(
+            t('menu.pause_on_battery'),
+            action_toggle_battery_pause,
+            checked=lambda item: bool(user_settings.get("pause_on_battery", True)),
+        ),
+        pystray.MenuItem(
+            t('menu.show_sparkline'),
+            action_toggle_sparkline,
+            checked=lambda item: bool(user_settings.get("show_sparkline", True)),
+        ),
+        pystray.MenuItem(
+            t('menu.show_cost'),
+            action_toggle_cost,
+            checked=lambda item: bool(user_settings.get("show_cost", True)),
+        ),
+        pystray.MenuItem(
+            t('menu.attribute_window'),
+            action_toggle_window_attribution,
+            checked=lambda item: bool(user_settings.get("attribute_active_window", False)),
+        ),
+        pystray.MenuItem(
+            t('menu.aggregate_accounts'),
+            action_toggle_aggregate,
+            checked=lambda item: bool(user_settings.get("aggregate_accounts", False)),
+        ),
         pystray.MenuItem(t('menu.icon_theme'), pystray.Menu(*theme_items)),
         pystray.MenuItem(t('menu.icon_style'), pystray.Menu(*style_items)),
         pystray.MenuItem(t('menu.poll_interval'),
@@ -723,20 +997,23 @@ def _build_console_menu():
     )
 
 
-def _menu_headline_text() -> str:
+def _menu_headline_text(metric: str = "session") -> str:
     snap = state.snapshot
     if state.token_error:
         return t('status.token_error')
     if state.paused_by_schedule:
         return t('status.paused')
+    if state.paused_by_battery:
+        return t('status.battery')
     if snap is None:
         return t('status.fetching')
     if not snap.ok:
         return t('status.api_error')
     name = state.active_account["name"] if state.active_account else config.APP_NAME
+    tag = "[Week]" if metric == "weekly" else "[5h]"
     if state.plan:
-        return f"● {name} · {state.plan}"
-    return f"● {name}"
+        return f"● {tag} {name} · {state.plan}"
+    return f"● {tag} {name}"
 
 
 def _menu_session_text() -> str:
@@ -764,7 +1041,8 @@ def _menu_weekly_text() -> str:
 def _menu_burn_text() -> str:
     bits = []
     for key, label in (("session", t('bar.session_short')),
-                       ("weekly", t('bar.weekly_short'))):
+                       (
+                       "weekly", t('bar.weekly_short'))):
         info = state.burn.get(key, {})
         rate = info.get("rate")
         eta = info.get("eta_seconds")
@@ -777,6 +1055,54 @@ def _menu_burn_text() -> str:
     return " · ".join(bits)
 
 
+def _menu_cost_text() -> str:
+    if not bool(user_settings.get("show_cost", True)):
+        return ""
+    usd = cost.today_usd()
+    if usd is None:
+        return ""
+    return f"💰 Today: {cost.format_cost(usd)}"
+
+
+def _menu_attribution_text() -> str:
+    if not bool(user_settings.get("attribute_active_window", False)):
+        return ""
+    try:
+        import attribution
+        rows = attribution.top_recent(hours=1.0, limit=3)
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    bits = [f"{title} +{delta}%" for title, delta in rows]
+    return "🪟 1h: " + " · ".join(bits)
+
+
+def _menu_aggregate_lines() -> list[str]:
+    """One line per non-active account when aggregate mode is on."""
+    if not bool(user_settings.get("aggregate_accounts", False)):
+        return []
+    active_id = state.active_account["id"] if state.active_account else None
+    out = []
+    for aid, info in state.aggregate.items():
+        if aid == active_id:
+            continue  # active account already shown in main rows
+        snap = info.get("snapshot")
+        if snap is None or not snap.ok or not snap.has_data:
+            continue
+        s = snap.session_pct if snap.session_pct is not None else "—"
+        w = snap.weekly_pct if snap.weekly_pct is not None else "—"
+        out.append(f"• {info['name']}: 5h {s}% · Wk {w}%")
+    return out
+
+
+def _menu_aggregate_text(slot: int) -> str:
+    lines = _menu_aggregate_lines()
+    if slot >= len(lines):
+        return ""
+    return lines[slot]
+
+
 # --- Entry point ----------------------------------------------------------
 
 def _redirect_stderr_to_log() -> None:
@@ -784,7 +1110,7 @@ def _redirect_stderr_to_log() -> None:
     a file so we can see unhandled tracebacks instead of the process
     silently disappearing."""
     try:
-        log_path = Path.home() / ".claude-quota-tray" / "error.log"
+        log_path = user_settings.SETTINGS_DIR / "error.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         stream = open(log_path, "a", encoding="utf-8", buffering=1)
         sys.stderr = stream
@@ -796,25 +1122,49 @@ def _redirect_stderr_to_log() -> None:
         pass
 
 
+def _make_icon(app_id: str, metric: str, style: Optional[str]) -> pystray.Icon:
+    icon = pystray.Icon(
+        app_id,
+        icon=render_icon(None, theme=_current_theme(),
+                         style=style or _current_icon_style()),
+        title=f"{config.APP_NAME}\nStarting…",
+        menu=build_menu(metric),
+    )
+    icon.metric_override = metric
+    if style:
+        icon.style_override = style
+    return icon
+
+
 def main():
+    import os as _os
     _redirect_stderr_to_log()
 
     try:
         user_settings.load()
         notifications.init(config.APP_NAME)
 
-        icon = pystray.Icon(
-            config.APP_ID,
-            icon=render_icon(None, theme=_current_theme(),
-                             style=_current_icon_style()),
-            title=f"{config.APP_NAME}\nStarting…",
-            menu=build_menu(),
-        )
+        dual = _os.environ.get("CQT_DUAL_ICON", "").lower() in ("1", "true", "yes")
 
-        poller = threading.Thread(target=poll_loop, args=(icon,), daemon=True)
-        poller.start()
-
-        icon.run()
+        if dual:
+            # Single process, two icons — one for 5h (frame), one for weekly (donut).
+            # The weekly icon runs in a daemon thread; the 5h icon owns the
+            # main-thread Win32 message loop.
+            ic_session = _make_icon(config.APP_ID, "session", "frame")
+            ic_weekly = _make_icon(config.APP_ID + "Weekly", "weekly", "donut")
+            ICONS.append(ic_session)
+            ICONS.append(ic_weekly)
+            threading.Thread(target=ic_weekly.run, daemon=True).start()
+            poller = threading.Thread(target=poll_loop, args=(ic_session,), daemon=True)
+            poller.start()
+            ic_session.run()
+        else:
+            metric = user_settings.get("headline_metric", "session")
+            ic = _make_icon(config.APP_ID, metric, None)
+            ICONS.append(ic)
+            poller = threading.Thread(target=poll_loop, args=(ic,), daemon=True)
+            poller.start()
+            ic.run()
         try:
             sys.stderr.write(
                 f"=== icon.run() returned cleanly "

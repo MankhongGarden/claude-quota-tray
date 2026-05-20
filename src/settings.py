@@ -8,13 +8,15 @@ values can change at runtime via the tray menu and survive across restarts.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict
 
 
-SETTINGS_DIR = Path.home() / ".claude-quota-tray"
+_override = os.environ.get("CQT_DATA_DIR")
+SETTINGS_DIR = Path(_override).expanduser() if _override else Path.home() / ".claude-quota-tray"
 SETTINGS_PATH = SETTINGS_DIR / "settings.json"
 
 _lock = threading.RLock()
@@ -42,9 +44,16 @@ def _defaults() -> Dict[str, Any]:
         },
         "theme": "auto",  # "auto" | "light" | "dark"
         "icon_style": "frame",  # "frame" | "solid" | "donut" | "bar"
+        "headline_metric": "session",  # "session" (5h) | "weekly" (7d) — which figure the tray icon shows
         "poll_interval_seconds": 60,
         "history_retention_days": 7,
         "language": None,  # None → auto-detect from locale on first read
+        "pause_on_battery": True,  # skip polls while laptop runs on battery
+        "eta_alert_minutes": 60,  # one-shot alert when projected to hit 100% within N min
+        "show_cost": True,  # show today's $ from ccusage in popup + menu
+        "show_sparkline": True,  # render Unicode trend bar in tooltip
+        "attribute_active_window": False,  # sample Win32 foreground window per poll
+        "aggregate_accounts": False,  # poll all configured accounts each cycle, not just active
     }
 
 

@@ -19,6 +19,7 @@ from bar_widget import (
     apply_bar, build_bar, format_burn, ui_font,
 )
 from i18n import t
+import settings as user_settings
 
 
 _window_lock = threading.Lock()
@@ -30,7 +31,7 @@ SnapshotFetcher = Callable[[], dict]
 
 def _log_error(where: str) -> None:
     try:
-        log = Path.home() / ".claude-quota-tray" / "error.log"
+        log = user_settings.SETTINGS_DIR / "error.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "a", encoding="utf-8") as f:
             f.write(

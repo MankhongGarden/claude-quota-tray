@@ -4,6 +4,10 @@ Pillow>=10.2.0
 # Windows-only: enables custom app name in toast notifications
 # (replaces "Python" source label with "Claude Quota Tray")
 windows-toasts>=1.1.0; sys_platform == "win32"
+# Battery state (auto-pause on battery) + active-window attribution
+psutil>=5.9.0
+# Cross-platform clipboard for "copy current %" menu action
+pyperclip>=1.8.0
 
 # History storage and chart popup use stdlib only (sqlite3, tkinter).
 # Theme detection on Windows uses winreg from the stdlib.

@@ -1,5 +1,51 @@
 # Claude Quota Tray
 
+> **ℹ Personal fork of [kpcrmv4/claude-quota-tray](https://github.com/kpcrmv4/claude-quota-tray)**
+>
+> Upstream is the canonical, supported version — use it unless you specifically
+> want one of the additions in this fork. All credit for the original design,
+> codebase, and Windows-tray rendering belongs to [@kpcrmv4](https://github.com/kpcrmv4)
+> ([KPWebappStudio](https://github.com/kpcrmv4/claude-quota-tray)).
+>
+> Branches in this fork:
+> - **`main`** — mirrors upstream; do not modify here
+> - **[`fix/stale-token-refresh`](https://github.com/MankhongGarden/claude-quota-tray/tree/fix/stale-token-refresh)** — single bug fix proposed back to upstream as [PR #4](https://github.com/kpcrmv4/claude-quota-tray/pull/4)
+> - **`local-enhancements`** — personal feature stack (see "Fork additions" below);
+>   not yet proposed upstream — waiting for author engagement on the open issues
+>   ([#1](https://github.com/kpcrmv4/claude-quota-tray/issues/1) · [#3](https://github.com/kpcrmv4/claude-quota-tray/issues/3))
+>   before drip-feeding individual PRs.
+>
+> License stays MIT — same as upstream. Original `LICENSE` file preserved unchanged.
+
+## Fork additions (in `local-enhancements`)
+
+1. **Stale-token survival** — re-read OAuth credentials on 401/403 so the tray
+   doesn't silently die after Claude Code rotates the access token
+   ([PR #4](https://github.com/kpcrmv4/claude-quota-tray/pull/4))
+2. **`CQT_DATA_DIR` env override** — run two instances side-by-side with
+   independent settings (per [#1](https://github.com/kpcrmv4/claude-quota-tray/issues/1))
+3. **`CQT_DUAL_ICON=1` single-process dual-icon** — one process, two tray
+   icons (5h frame · Weekly donut), shared poll loop
+4. **ETA-based alert** — toast when `state.burn.eta_seconds` projects 100%
+   within configurable window (default 60 min)
+5. **Sparkline in tooltip** — 24h Unicode trend bar (`▁▂▃▅▆█`) of the headline
+   metric, glanceable on hover
+6. **`ccusage` cost integration** — today's USD spend rendered alongside the
+   `%`, refreshed in a background thread to avoid blocking the UI
+7. **Cross-account aggregation** — `aggregate_accounts: true` polls every
+   configured account each cycle, surfaces each in the right-click menu
+8. **Active-window attribution** — opt-in; samples Win32 foreground window
+   on poll, attributes session-pct deltas, surfaces top 3 in last hour
+9. **Auto-pause on battery** — skip polls (and API calls) when laptop is
+   unplugged, default-on, toggleable
+10. **"Copy current %" menu action** — clipboard copy for sharing in chat
+
+Each item is opt-in via either a `settings.json` key, env var, or right-click
+menu toggle. Defaults preserve original single-icon, schedule-paused, non-aggregate
+behaviour.
+
+---
+
 ไอคอน system tray สำหรับ **Windows** ที่แสดงปริมาณการใช้งาน Claude (5-hour limit และ Weekly limit) ที่เหลืออยู่ — แค่เหลือบดูมุมจอก็รู้
 
 <p align="center">
