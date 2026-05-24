@@ -1092,9 +1092,42 @@ def _make_icon(app_id: str, metric: str, style: Optional[str]) -> pystray.Icon:
     return icon
 
 
+_instance_lock_handle = None
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Per-data-dir exclusive lock: a 2nd copy of THIS instance (same
+    CQT_DATA_DIR) refuses to start, while main + weekly (different data dirs)
+    still coexist. The OS frees the lock when the process exits, so a crash
+    never leaves it stale. No-op off Windows."""
+    global _instance_lock_handle
+    if sys.platform != "win32":
+        return True
+    import msvcrt
+    try:
+        user_settings.SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        fh = open(user_settings.SETTINGS_DIR / "instance.lock", "a+")
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        _instance_lock_handle = fh  # keep handle alive for process lifetime
+        return True
+    except OSError:
+        return False
+
+
 def main():
     import os as _os
     _redirect_stderr_to_log()
+
+    if not _acquire_single_instance_lock():
+        try:
+            sys.stderr.write(
+                f"=== duplicate instance for {user_settings.SETTINGS_DIR} — "
+                f"exiting {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+            )
+        except Exception:
+            pass
+        return
 
     try:
         user_settings.load()
