@@ -53,21 +53,49 @@ def find_credentials_path() -> Optional[Path]:
     return None
 
 
+# Subtrees that hold OAuth tokens for OTHER services (MCP servers such as
+# Cloudflare, Sentry, Vercel, Composio/connect-apps). Those tokens are NOT
+# valid against the Anthropic API — using one returns HTTP 401 — so the
+# generic search must never descend into them.
+_FOREIGN_TOKEN_KEYS = ("mcpOAuth",)
+
+
 def _extract_token(data) -> Optional[str]:
-    """Recursively search a dict/list for a likely token value."""
+    """Return the Claude subscription OAuth token from a credentials blob.
+
+    Claude Code stores it at ``claudeAiOauth.accessToken``. We check that
+    location first, then fall back to a generic recursive search that skips
+    the mcpOAuth subtree so we never hand back a third-party MCP token
+    (which the Anthropic API rejects with 401).
+    """
+    if isinstance(data, dict):
+        cao = data.get("claudeAiOauth")
+        if isinstance(cao, dict):
+            for key in _TOKEN_KEYS:
+                v = cao.get(key)
+                if isinstance(v, str) and v:
+                    return v
+    return _extract_token_generic(data)
+
+
+def _extract_token_generic(data) -> Optional[str]:
+    """Recursively search a dict/list for a likely token value, skipping
+    foreign-service OAuth subtrees (see _FOREIGN_TOKEN_KEYS)."""
     if isinstance(data, dict):
         # Direct hit on a known key
         for key in _TOKEN_KEYS:
             if key in data and isinstance(data[key], str) and data[key]:
                 return data[key]
-        # Recurse
-        for value in data.values():
-            result = _extract_token(value)
+        # Recurse, skipping subtrees that belong to other services
+        for k, value in data.items():
+            if k in _FOREIGN_TOKEN_KEYS:
+                continue
+            result = _extract_token_generic(value)
             if result:
                 return result
     elif isinstance(data, list):
         for item in data:
-            result = _extract_token(item)
+            result = _extract_token_generic(item)
             if result:
                 return result
     return None

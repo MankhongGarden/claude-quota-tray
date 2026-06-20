@@ -55,6 +55,11 @@ class AppState:
         self.stop = threading.Event()
         self.fired_thresholds = {"session": set(), "weekly": set()}
         self.last_prune = 0.0
+        # Monotonic-ish wall clock of the last poll-loop iteration. The
+        # heartbeat thread keys off this so a wedged poll loop (alive process,
+        # frozen polling) lets the heartbeat go stale and the watchdog can
+        # restart us. 0.0 until main() baselines it just before the loop spins.
+        self.last_loop_tick = 0.0
         self.active_account: Optional[dict] = None
         self.plan: Optional[str] = None
         self.paused_by_schedule = False
@@ -192,6 +197,7 @@ def _poll_loop_inner(icon: pystray.Icon):
         # Without a token, sit idle but keep checking — user can configure
         # an account from the menu and we'll pick it up on next iteration.
         while not state.stop.is_set():
+            state.last_loop_tick = time.time()
             state.force_refresh.clear()
             state.force_refresh.wait(timeout=30)
             _load_active_token()
@@ -204,6 +210,7 @@ def _poll_loop_inner(icon: pystray.Icon):
     time.sleep(config.INITIAL_DELAY_SECONDS)
 
     while not state.stop.is_set():
+        state.last_loop_tick = time.time()
         if not _within_schedule():
             state.paused_by_schedule = True
             state.paused_by_battery = False
@@ -1060,6 +1067,11 @@ def _start_heartbeat_thread() -> None:
     never see. Heartbeat-file mtime sidesteps the PID-namespace mismatch
     entirely.
     """
+    # If the poll loop hasn't ticked in this long, treat it as wedged and
+    # stop refreshing the heartbeat so the external watchdog restarts us.
+    # Must exceed the largest poll interval (300s) plus margin.
+    WEDGE_THRESHOLD_SECONDS = 600
+
     def _beat():
         hb = user_settings.SETTINGS_DIR / "tray.heartbeat"
         try:
@@ -1067,12 +1079,15 @@ def _start_heartbeat_thread() -> None:
         except Exception:
             pass
         while not state.stop.is_set():
-            try:
-                hb.touch(exist_ok=True)
-                _os = __import__("os")
-                _os.utime(hb, None)
-            except Exception:
-                pass
+            tick = state.last_loop_tick
+            poll_wedged = tick and (time.time() - tick) > WEDGE_THRESHOLD_SECONDS
+            if not poll_wedged:
+                try:
+                    hb.touch(exist_ok=True)
+                    _os = __import__("os")
+                    _os.utime(hb, None)
+                except Exception:
+                    pass
             state.stop.wait(timeout=30)
 
     threading.Thread(target=_beat, daemon=True).start()
@@ -1131,6 +1146,7 @@ def main():
 
     try:
         user_settings.load()
+        state.last_loop_tick = time.time()
         _start_heartbeat_thread()
         notifications.init(config.APP_NAME)
 
