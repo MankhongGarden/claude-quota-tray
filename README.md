@@ -43,6 +43,11 @@
 9. **Auto-pause on battery** — skip polls (and API calls) when laptop is
    unplugged, default-on, toggleable
 10. **"Copy current %" menu action** — clipboard copy for sharing in chat
+11. **Per-model quota buckets** — reads the OAuth usage endpoint that Claude Code
+    `/usage` uses, so the weekly Opus / Sonnet / Fable windows show up next to the
+    account-wide ones; buckets are generic, so a new one needs no code change.
+    Any icon can be pointed at any bucket (or at whichever is closest to full),
+    and the header method stays as an automatic fallback.
 
 Each item is opt-in via either a `settings.json` key, env var, or right-click
 menu toggle. Defaults preserve original single-icon, schedule-paused, non-aggregate
@@ -70,7 +75,7 @@ behaviour.
 ## คุณสมบัติ
 
 - 🔋 แสดง % การใช้งานบน tray icon (เปลี่ยนสีตามระดับ — เขียว/เหลือง/ส้ม/แดง พร้อมตัวอักษรปรับสีอัตโนมัติให้อ่านง่ายบนทุกพื้นหลัง)
-- 🖱️ คลิกซ้าย → popup เล็กพร้อมหลอด progress bar 2 หลอด (5-hour + Weekly) + burn rate / ETA
+- 🖱️ คลิกซ้าย → popup เล็ก หลอด progress bar หนึ่งหลอดต่อ bucket (5-hour, Weekly, Weekly · Opus, Weekly · Fable …) + burn rate / ETA
 - 🖱️ คลิกขวา → เมนูพร้อม Unicode progress bar `🟡 5h ███████░░░ 67%` อ่านได้จากเมนูเลย
 - 📈 หน้าต่าง history 24 ชั่วโมง — กราฟ trend + หลอดสรุปปัจจุบัน
 - 🔥 Burn rate / ETA — บอกว่าใช้กี่ %/ชม. และจะเต็มในกี่ชั่วโมง
@@ -79,8 +84,9 @@ behaviour.
 - ⏰ Schedule — pause polling นอกเวลาทำงาน (เช่น เฉพาะ จ–ศ 9:00–18:00)
 - 🌗 Auto theme — ตามธีม Windows light/dark
 - 💾 History storage — เก็บ snapshot ใน SQLite (default 7 วัน) สำหรับวาดกราฟและคำนวณ burn rate
+- 🧩 Quota แยกตามโมเดล — อ่าน bucket รายสัปดาห์ของ Opus / Sonnet / Fable แยกจากโควตารวม · เลือกได้ว่าไอคอนไหนโชว์ bucket ไหน (หรือ "Busiest bucket" ให้สลับเอง)
 - 💰 ใช้ OAuth token ของ Claude Code ที่มีอยู่แล้ว ไม่ต้องเปิด API account แยก
-- 🪶 ค่าใช้จ่ายต่อ poll ≈ 1 token Haiku (สำหรับผู้ใช้ subscription รวมในแพ็คเกจอยู่แล้ว)
+- 🪶 อ่านจาก usage endpoint โดยตรง — ไม่กิน token เลย (fallback แบบ header ใช้ ≈ 1 token Haiku ต่อ poll)
 
 <p align="center">
   <img src="assets/features.png" width="900" alt="Features showcase" />
@@ -154,7 +160,8 @@ build.bat
 | **Sound alerts** | Settings → Sound alerts | toggle (ใช้ winsound บน Windows) |
 | **Schedule** | Settings → Schedule settings… | เลือกชั่วโมง start/end + วันในสัปดาห์ |
 | **Icon theme** | Settings → Icon theme | Auto / Light / Dark |
-| **Poll interval** | Settings → Poll interval | 30s / 1m / 2m / 5m |
+| **Tray icon shows** | Settings → Tray icon shows | เลือก bucket ที่ไอคอนนี้จะโชว์ (5-hour / Weekly / Weekly · Opus / …) หรือ Busiest bucket |
+| **Poll interval** | Settings → Poll interval | 3m / 5m / 10m / 30m (usage endpoint 429 ถ้าถี่กว่า 3 นาที) |
 | **Multiple accounts** | Account → Manage accounts… | Add/Rename/Remove credentials path |
 
 ค่าทั้งหมดเก็บที่ `~/.claude-quota-tray/settings.json`
@@ -162,14 +169,20 @@ build.bat
 ## วิธีทำงานเบื้องหลัง
 
 1. แอปอ่าน OAuth token จาก `%USERPROFILE%\.claude\.credentials.json` (หรือ path ที่ user ตั้งใน Account)
-2. ทุก N วินาที (default 60) ยิง POST ไป `https://api.anthropic.com/v1/messages` ด้วย body 1 token ของ Haiku
-3. **ไม่สนใจ response body** — อ่านเฉพาะ response headers:
-   - `anthropic-ratelimit-unified-5h-utilization` → 5-hour usage %
-   - `anthropic-ratelimit-unified-5h-reset` → เวลา reset
-   - `anthropic-ratelimit-unified-7d-utilization` → weekly usage %
-   - `anthropic-ratelimit-unified-7d-reset` → เวลา reset
-4. บันทึก snapshot ลง SQLite (`~/.claude-quota-tray/history.db`) สำหรับวาดกราฟ + คำนวณ burn rate
-5. วาดไอคอนใหม่และอัพเดต tooltip + เมนู
+2. ทุก N วินาที (ขั้นต่ำ 180) ยิง GET ไป `https://api.anthropic.com/api/oauth/usage` — endpoint เดียวกับที่หน้า `/usage`
+   ใน Claude Code ใช้ · ไม่กิน token และเป็นแหล่งเดียวที่บอก quota **แยกตามโมเดล**:
+   - `five_hour` → รอบ 5 ชั่วโมง (ทุกโมเดลรวมกัน)
+   - `seven_day` → รอบสัปดาห์ (ทุกโมเดลรวมกัน)
+   - `seven_day_opus` · `seven_day_sonnet` · `seven_day_fable` → รอบสัปดาห์แยกต่อ model family
+     (โผล่เฉพาะแพ็กเกจ/โมเดลที่บัญชีนั้นใช้จริง · bucket ใหม่ที่ Anthropic เพิ่มทีหลังจะขึ้นเองโดยไม่ต้องแก้โค้ด)
+   - `extra_usage` → โควตาส่วนเกิน (ถ้าเปิดไว้)
+3. ถ้า endpoint ใช้ไม่ได้ (เช่น token ชนิดอื่น หรือ Anthropic ปิด) → fallback ไปยิง POST `/v1/messages`
+   ด้วย body 1 token ของ Haiku แล้วอ่าน `anthropic-ratelimit-unified-*` headers แทน — ได้แค่ระดับบัญชี
+   (5h + weekly) และเมนูจะบอกว่ากำลังใช้ fallback อยู่
+4. บันทึก snapshot ลง SQLite (`~/.claude-quota-tray/history.db`) — คอลัมน์ `claims_json` เก็บทุก bucket
+   (คอลัมน์ session/weekly เดิมยังเขียนอยู่ ข้อมูลเก่าจึงอ่านต่อได้) สำหรับวาดกราฟ + คำนวณ burn rate ต่อ bucket
+5. วาดไอคอนใหม่และอัพเดต tooltip + เมนู · เลือกได้ว่าแต่ละไอคอนจะโชว์ bucket ไหน (Settings → Tray icon shows)
+   หรือ "Busiest bucket" ให้มันสลับไปตัวที่ใกล้เต็มที่สุดเอง
 
 ## โครงสร้างโปรเจกต์
 
@@ -177,7 +190,11 @@ build.bat
 claude-quota-tray/
 ├── src/
 │   ├── main.py             ← entry point + tray loop + menu
-│   ├── api_client.py       ← ยิง API + parse headers
+│   ├── flyout.py           ← แผงไร้ขอบที่เด้งตอนคลิกซ้ายไอคอน
+│   ├── dpi.py              ← DPI awareness + scale ของทุกหน้าต่าง
+│   ├── usage_api.py        ← อ่าน quota จาก OAuth usage endpoint (+ fallback)
+│   ├── claims.py           ← bucket โควตาแบบ generic (5h · weekly · ต่อโมเดล)
+│   ├── api_client.py       ← fallback: ยิง API + parse headers
 │   ├── token_reader.py     ← อ่าน OAuth token cross-platform
 │   ├── icon_renderer.py    ← วาดไอคอน % แบบ dynamic (auto-contrast text)
 │   ├── config.py           ← env-driven defaults
@@ -188,7 +205,6 @@ claude-quota-tray/
 │   ├── sound.py            ← winsound alert beep
 │   ├── notifications.py    ← Windows toast (windows-toasts) + pystray fallback
 │   ├── bar_widget.py       ← shared Tk progress-bar widget
-│   ├── status_window.py    ← compact popup (left-click)
 │   ├── history_window.py   ← full 24h chart window
 │   └── settings_dialogs.py ← Tk dialogs (Manage accounts, Schedule, Thresholds)
 ├── Setup claude quota tray.bat     ← installer (1-click)

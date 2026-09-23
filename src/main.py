@@ -1,10 +1,10 @@
 """
 Claude Quota Tray — entry point.
 
-A small system-tray app for Windows (and macOS/Linux) that polls Claude's
-usage headers and displays the higher of session/weekly utilisation as a
-coloured badge in the tray. Hover the icon for full details, right-click
-for actions.
+A small system-tray app for Windows (and macOS/Linux) that polls Claude
+usage and displays one bucket as a coloured badge in the tray. Hover the
+icon for every bucket the plan has — the 5-hour and weekly windows plus the
+per-model weekly ones (Opus / Sonnet / Fable) — right-click for actions.
 """
 
 import subprocess
@@ -13,9 +13,17 @@ import threading
 import time
 import traceback
 import webbrowser
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+import dpi
+
+# Before anything can create a window: an unaware process draws on a
+# virtualised 96-DPI desktop and is then stretched, which is what made the
+# panels look soft. This also lifts the tray icon slot from 16px to 20px.
+dpi.enable()
 
 import pystray
 
@@ -27,13 +35,15 @@ import history
 import sound
 import theme as theme_mod
 import accounts
+import flyout
 import history_window
-import status_window
 import settings_dialogs
 import tk_host
-from i18n import LANGUAGES, set_language, t
+from i18n import LANGUAGES, claim_label, set_language, t
 from bar_widget import color_emoji, unicode_bar
 from api_client import fetch_usage, format_reset, UsageSnapshot
+from claims import normalize_key, sorted_keys, model_label, split_key
+from usage_api import MIN_POLL_SECONDS, fetch_best
 from icon_renderer import render_icon
 from token_reader import TokenError
 
@@ -50,41 +60,55 @@ class AppState:
         self.token: Optional[str] = None
         self.token_error: Optional[str] = None
         self.snapshot: Optional[UsageSnapshot] = None
-        self.burn: dict = {"session": {}, "weekly": {}}
+        self.burn: dict = {}
         self.force_refresh = threading.Event()
         self.stop = threading.Event()
-        self.fired_thresholds = {"session": set(), "weekly": set()}
+        # Keyed by claim key; buckets appear as the account uses them.
+        self.fired_thresholds: dict = defaultdict(set)
         self.last_prune = 0.0
-        # Monotonic-ish wall clock of the last poll-loop iteration. The
-        # heartbeat thread keys off this so a wedged poll loop (alive process,
-        # frozen polling) lets the heartbeat go stale and the watchdog can
-        # restart us. 0.0 until main() baselines it just before the loop spins.
+        # time.monotonic() of the last poll-loop iteration. The heartbeat
+        # thread keys off this so a wedged poll loop (alive process, frozen
+        # polling) lets the heartbeat go stale and the watchdog can restart us.
+        # Monotonic, not wall clock: sleeping the laptop advances the wall
+        # clock by the whole nap and would look exactly like a wedge.
+        # 0.0 until main() baselines it just before the loop spins.
         self.last_loop_tick = 0.0
         self.active_account: Optional[dict] = None
         self.plan: Optional[str] = None
         self.paused_by_schedule = False
         self.paused_by_battery = False
-        self.fired_eta = {"session": False, "weekly": False}
+        self.fired_eta: dict = defaultdict(bool)
 
     @property
     def headline_pct(self) -> Optional[int]:
         return self.headline_pct_for(user_settings.get("headline_metric", "session"))
 
-    def headline_pct_for(self, metric: str) -> Optional[int]:
-        """Number shown on the tray icon for a specific metric.
+    def headline_claim_for(self, metric: str):
+        """The bucket a given icon shows.
 
-        `metric` is "session" (5h) or "weekly" (7d). Falls back to the other
-        figure when the preferred one is missing.
+        `metric` is a claim key ("five_hour", "seven_day_opus", ...), one of
+        the legacy names ("session" / "weekly"), or "auto" for whichever
+        bucket is closest to full. Falls back to any bucket with data so the
+        icon never goes blank just because one window is missing.
         """
-        if not self.snapshot or not self.snapshot.has_data:
+        snap = self.snapshot
+        if not snap or not snap.has_data:
             return None
-        if metric == "weekly":
-            if self.snapshot.weekly_pct is not None:
-                return self.snapshot.weekly_pct
-            return self.snapshot.session_pct
-        if self.snapshot.session_pct is not None:
-            return self.snapshot.session_pct
-        return self.snapshot.weekly_pct
+        if metric == "auto":
+            return snap.worst_claim()
+        claim = snap.claim(metric)
+        if claim and claim.has_data:
+            return claim
+        for fallback in ("five_hour", "seven_day"):
+            claim = snap.claim(fallback)
+            if claim and claim.has_data:
+                return claim
+        return snap.worst_claim()
+
+    def headline_pct_for(self, metric: str) -> Optional[int]:
+        """Number shown on the tray icon for a specific bucket."""
+        claim = self.headline_claim_for(metric)
+        return claim.pct if claim else None
 
     @property
     def is_error(self) -> bool:
@@ -103,12 +127,41 @@ ICONS: list = []
 
 
 def _metric_for(icon) -> str:
-    """Read the per-icon metric override that was stamped at construction,
-    falling back to the user_settings default for backward compatibility."""
+    """Bucket this icon shows: per-icon override, else the saved setting.
+
+    Returns a canonical claim key, or "auto" for the busiest bucket.
+    """
     override = getattr(icon, "metric_override", None)
-    if override in ("session", "weekly"):
-        return override
-    return user_settings.get("headline_metric", "session")
+    return _normalize_metric(override or user_settings.get("headline_metric", "session"))
+
+
+def _normalize_metric(metric) -> str:
+    if metric == "auto":
+        return "auto"
+    return normalize_key(metric or "five_hour")
+
+
+def _available_metrics() -> list[str]:
+    """Bucket keys the user can point an icon at, busiest-first order aside."""
+    keys = set()
+    if state.snapshot:
+        keys.update(k for k, c in state.snapshot.claims.items() if c.has_data)
+    keys.update({"five_hour", "seven_day"})
+    return sorted_keys(keys)
+
+
+def _label(claim) -> str:
+    """Full label for a bucket, using the name the server gave its scope."""
+    return claim_label(claim.key, getattr(claim, "display_name", None))
+
+
+def _compact_label(claim) -> str:
+    """Short label for tooltips: scope name alone for scoped buckets."""
+    display = getattr(claim, "display_name", None)
+    if display:
+        return display
+    _window, model = split_key(normalize_key(claim.key))
+    return model_label(model) if model else claim_label(claim.key)
 
 
 # --- Helpers --------------------------------------------------------------
@@ -197,7 +250,7 @@ def _poll_loop_inner(icon: pystray.Icon):
         # Without a token, sit idle but keep checking — user can configure
         # an account from the menu and we'll pick it up on next iteration.
         while not state.stop.is_set():
-            state.last_loop_tick = time.time()
+            state.last_loop_tick = time.monotonic()
             state.force_refresh.clear()
             state.force_refresh.wait(timeout=30)
             _load_active_token()
@@ -210,7 +263,7 @@ def _poll_loop_inner(icon: pystray.Icon):
     time.sleep(config.INITIAL_DELAY_SECONDS)
 
     while not state.stop.is_set():
-        state.last_loop_tick = time.time()
+        state.last_loop_tick = time.monotonic()
         if not _within_schedule():
             state.paused_by_schedule = True
             state.paused_by_battery = False
@@ -225,7 +278,7 @@ def _poll_loop_inner(icon: pystray.Icon):
             if state.token is None:
                 _load_active_token()
             if state.token:
-                snapshot = fetch_usage(state.token, model=config.MODEL)
+                snapshot = fetch_best(state.token, plan=state.plan, model=config.MODEL)
                 # Stale-token guard: Claude Code rotates OAuth access tokens
                 # periodically. If our cached token was rotated out from under
                 # us, the API returns 401/403. Re-read the credentials file
@@ -236,7 +289,7 @@ def _poll_loop_inner(icon: pystray.Icon):
                         and not snapshot.has_data):
                     _load_active_token()
                     if state.token:
-                        snapshot = fetch_usage(state.token, model=config.MODEL)
+                        snapshot = fetch_best(state.token, plan=state.plan, model=config.MODEL)
                 state.snapshot = snapshot
                 acct_id = state.active_account["id"] if state.active_account else "unknown"
                 history.record(acct_id, snapshot)
@@ -246,9 +299,22 @@ def _poll_loop_inner(icon: pystray.Icon):
             _refresh_all_icons()
 
         _maybe_prune()
-        interval = int(user_settings.get("poll_interval_seconds", config.POLL_INTERVAL_SECONDS))
         state.force_refresh.clear()
-        state.force_refresh.wait(timeout=max(15, interval))
+        state.force_refresh.wait(timeout=_effective_interval())
+
+
+def _effective_interval() -> int:
+    """
+    Seconds to wait before the next poll.
+
+    The usage endpoint rate-limits by User-Agent and starts returning 429s
+    when polled faster than ~3 minutes. Every poll tries that endpoint first —
+    even the ones that ended up on the header fallback — so the floor applies
+    to all of them, not just to polls that succeeded there.
+    """
+    interval = int(user_settings.get("poll_interval_seconds",
+                                     config.POLL_INTERVAL_SECONDS))
+    return max(MIN_POLL_SECONDS, interval)
 
 
 def _maybe_prune():
@@ -278,6 +344,11 @@ def _refresh_icon(icon: pystray.Icon):
         icon.update_menu()
     except Exception:
         _log_action_error("_refresh_icon:menu")
+    try:
+        if tk_host.is_ready():
+            tk_host.spawn(lambda _root: flyout.refresh_all())
+    except Exception:
+        _log_action_error("_refresh_icon:flyout")
 
 
 def _refresh_all_icons():
@@ -320,18 +391,19 @@ def _sparkline(values: list[int], width: int = 16) -> str:
 
 
 def _headline_sparkline(metric: str = "session") -> str:
-    """Sparkline of the given metric over the last 24h."""
+    """Sparkline of the bucket this icon shows, over the last 24h."""
     if not bool(user_settings.get("show_sparkline", True)):
         return ""
     acct = state.active_account
     if not acct:
         return ""
-    idx = 2 if metric == "weekly" else 1
+    claim = state.headline_claim_for(_normalize_metric(metric))
+    key = claim.key if claim else "five_hour"
     try:
-        rows = history.recent(24, acct["id"])
+        points = history.series(key, 24, acct["id"])
     except Exception:
         return ""
-    return _sparkline([r[idx] for r in rows], width=16)
+    return _sparkline([p[1] for p in points], width=16)
 
 
 def _build_tooltip(metric: str = "session") -> str:
@@ -350,39 +422,78 @@ def _build_tooltip(metric: str = "session") -> str:
             f"{t('status.error_tooltip', msg=snap.error or 'unknown')}"
         )
 
-    name = state.active_account["name"] if state.active_account else config.APP_NAME
-    tag = "[Week]" if metric == "weekly" else "[5h]"
-    header = f"{tag} {name}"
+    headline = state.headline_claim_for(_normalize_metric(metric))
+    tag = f"[{_compact_label(headline)}]" if headline else "[5h]"
+    # The tag is what tells the two icons apart, so it always stays. The
+    # account name only earns its characters when there is more than one.
+    if len(accounts.list_accounts()) > 1 and state.active_account:
+        header = f"{tag} {state.active_account['name']}"
+    else:
+        header = tag
     if state.plan:
         header += f" · {state.plan}"
 
-    parts = []
-    if snap.session_pct is not None:
-        parts.append(
-            f"{t('bar.session_short')} {snap.session_pct}% "
-            f"→ {format_reset(snap.session_reset_seconds)}"
-        )
-    if snap.weekly_pct is not None:
-        parts.append(
-            f"{t('bar.weekly_short')} {snap.weekly_pct}% "
-            f"→ {format_reset(snap.weekly_reset_seconds)}"
-        )
+    # Headline bucket first, then the rest — the Win32 tooltip is short, so
+    # per-model buckets get the compact label (just "Opus", "Fable", ...).
+    ordered = snap.ordered_claims()
+    if headline:
+        ordered = [headline] + [c for c in ordered if c.key != headline.key]
 
+    claim_lines = [
+        f"{_compact_label(claim)} {claim.pct}% → {format_reset(claim.reset_seconds)}"
+        for claim in ordered
+    ]
+    if not claim_lines:
+        return _truncate(f"{header}\n{t('status.no_headers')}")
+
+    optional = []
     spark = _headline_sparkline(metric)
     if spark:
-        parts.append(f"24h: {spark}")
+        optional.append(f"24h: {spark}")
     if bool(user_settings.get("show_cost", True)):
         usd = cost.today_usd()
         if usd is not None:
-            parts.append(f"Today: {cost.format_cost(usd)}")
-    body = "\n".join(parts) if parts else t('status.no_headers')
-    return _truncate(f"{header}\n{body}")
+            optional.append(f"Today: {cost.format_cost(usd)}")
+
+    return _fit_lines(header, claim_lines, optional)
+
+
+def _utf16_len(text: str) -> int:
+    """Length in UTF-16 code units, which is what szTip actually counts.
+
+    An emoji in an account name is one Python character but two units, so
+    counting characters could let the buffer overflow.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _fit_lines(header: str, claim_lines: list[str],
+               optional: list[str], limit: int = _TOOLTIP_MAX) -> str:
+    """Fit whole lines into the tooltip budget — never half a line.
+
+    szTip is a fixed WCHAR[128]; one unit over and pystray raises inside its
+    own thread and the icon never appears at all. Buckets are added first, the
+    sparkline and cost last, and anything that does not fit is dropped
+    entirely rather than cut mid-word.
+    """
+    lines = [header]
+
+    def fits(extra: str) -> bool:
+        return _utf16_len("\n".join(lines + [extra])) <= limit
+
+    for line in claim_lines:
+        if fits(line):
+            lines.append(line)
+    for line in optional:
+        if fits(line):
+            lines.append(line)
+    return "\n".join(lines)
 
 
 def _eta_summary() -> Optional[str]:
     bits = []
-    for key, label in (("session", t('bar.session_short')),
-                       ("weekly", t('bar.weekly_short'))):
+    for key in _live_claim_keys():
+        label = claim_label(key)
         info = state.burn.get(key, {})
         eta = info.get("eta_seconds")
         rate = info.get("rate")
@@ -404,16 +515,23 @@ def _sample_active_window(snap: UsageSnapshot):
         _log_action_error("attribution.record")
 
 
+def _live_claim_keys() -> list[str]:
+    """Buckets with data in the latest snapshot."""
+    snap = state.snapshot
+    if not snap:
+        return []
+    return [c.key for c in snap.ordered_claims()]
+
+
 def _check_notifications(icon: pystray.Icon, snap: UsageSnapshot):
     if not snap.ok or not snap.has_data:
         return
 
     thresholds = _thresholds()
     play_sound = bool(user_settings.get("sound_alerts", True))
-    pairs = [
-        ("session", snap.session_pct, t('bar.session_short')),
-        ("weekly", snap.weekly_pct, t('bar.weekly_short')),
-    ]
+    # Every bucket alerts on its own — a full Opus week matters even while
+    # the all-model week still has room.
+    pairs = [(c.key, c.pct, _label(c)) for c in snap.ordered_claims()]
     for key, pct, label in pairs:
         if pct is None:
             continue
@@ -467,11 +585,7 @@ def action_copy_pct(icon, item):
     snap = state.snapshot
     if not snap or not snap.has_data:
         return
-    parts = []
-    if snap.session_pct is not None:
-        parts.append(f"5h {snap.session_pct}%")
-    if snap.weekly_pct is not None:
-        parts.append(f"Weekly {snap.weekly_pct}%")
+    parts = [f"{_compact_label(c)} {c.pct}%" for c in snap.ordered_claims()]
     text = " · ".join(parts)
     try:
         import pyperclip
@@ -492,23 +606,27 @@ def _log_action_error(where: str) -> None:
         pass
 
 
-def action_show_status(icon, item):
-    """Left-click action: open the compact status popup with progress bars.
-    Falls back to the full history window if the popup fails to spawn."""
-    if state.token_error:
-        notifications.notify(icon,
-                             t('toast.token_error_title', app=config.APP_NAME),
-                             state.token_error[:200])
-        return
-    name = state.active_account["name"] if state.active_account else config.APP_NAME
-    try:
-        ok = status_window.show(name, get_data=_current_data)
-    except Exception:
-        _log_action_error("action_show_status:status_window")
-        ok = False
+def _toggle_flyout(icon, root) -> None:
+    """Open or close this icon's panel, on the Tk thread.
 
-    if ok:
-        return
+    The metric is read at render time rather than captured, so switching the
+    icon's bucket from the menu reaches a panel that is already open.
+    """
+    panel = flyout.for_icon(icon, root,
+                            lambda: _current_data(_metric_for(icon)))
+    if panel is not None:
+        panel.toggle()
+
+
+def action_show_status(icon, item):
+    """Left click: toggle the flyout. It renders its own error states, so a
+    missing token no longer short-circuits to a notification."""
+    try:
+        if tk_host.is_ready():
+            tk_host.spawn(lambda root: _toggle_flyout(icon, root))
+            return
+    except Exception:
+        _log_action_error("action_show_status:flyout")
 
     # Fallback: open the proven history window instead.
     try:
@@ -524,11 +642,8 @@ def action_show_status(icon, item):
 
     # Last resort: notification with current numbers.
     snap = state.snapshot
-    parts = []
-    if snap and snap.session_pct is not None:
-        parts.append(f"{t('bar.session_short')}: {snap.session_pct}%")
-    if snap and snap.weekly_pct is not None:
-        parts.append(f"{t('bar.weekly_short')}: {snap.weekly_pct}%")
+    parts = [f"{_label(c)}: {c.pct}%"
+             for c in (snap.ordered_claims() if snap else [])]
     notifications.notify(icon, config.APP_NAME,
                          " · ".join(parts) or t('status.no_data'))
 
@@ -549,6 +664,11 @@ def action_quit(icon, item):
             ic.stop()
         except Exception:
             pass
+    try:
+        if tk_host.is_ready():
+            tk_host.spawn(lambda _root: flyout.destroy_all())
+    except Exception:
+        pass
     tk_host.stop()
 
 
@@ -564,15 +684,55 @@ def action_open_console_limits(icon, item):
     webbrowser.open(CONSOLE_LIMITS_URL)
 
 
-def _current_data() -> dict:
+def _current_data(metric: str = "session") -> dict:
+    """Everything the flyout and the history window render.
+
+    The default argument keeps `history_window.show(get_data=_current_data)`
+    working, which calls it with no arguments.
+    """
     snap = state.snapshot
+    claims_out = [
+        {
+            "key": c.key,
+            "label": _label(c),
+            # The flyout puts one bucket per row under a shared window, so the
+            # scope alone reads better there than "Weekly · Fable".
+            "short_label": _compact_label(c),
+            "pct": c.pct,
+            "reset": c.reset_seconds,
+            "cap_fraction": c.cap_fraction,
+        }
+        for c in (snap.ordered_claims() if snap else [])
+    ]
     return {
+        # Every bucket, for the popup that renders one bar each.
+        "claims": claims_out,
+        "source": snap.source if snap else None,
+        "extra_usage": snap.extra_usage if snap else None,
+        # Where the weekly window went, by surface (Claude Code / Chats / ...).
+        "weekly_breakdown": (snap.meta or {}).get("weekly_breakdown") if snap else None,
+        # Legacy keys kept for older window code.
         "session_pct": snap.session_pct if snap else None,
         "weekly_pct": snap.weekly_pct if snap else None,
         "session_reset": snap.session_reset_seconds if snap else None,
         "weekly_reset": snap.weekly_reset_seconds if snap else None,
         "burn": state.burn,
         "plan": state.plan,
+        # Flyout state.
+        "account": state.active_account["name"] if state.active_account else None,
+        "headline_key": (lambda c: c.key if c else None)(
+            state.headline_claim_for(_normalize_metric(metric))),
+        "known_keys": _available_metrics(),
+        "fetched_at": snap.fetched_at if snap else None,
+        # None means "no reading yet", which is not the same as a failed one —
+        # the flyout paints those two states differently.
+        "ok": bool(snap.ok) if snap else None,
+        "error": snap.error if snap else None,
+        "token_error": state.token_error,
+        "paused": ("schedule" if state.paused_by_schedule
+                   else "battery" if state.paused_by_battery else None),
+        "poll_interval": _effective_interval(),
+        "thresholds": _thresholds(),
     }
 
 
@@ -589,7 +749,7 @@ def action_show_history(icon, item):
 
 def _on_settings_changed(icon: pystray.Icon):
     def _cb():
-        state.fired_thresholds = {"session": set(), "weekly": set()}
+        state.fired_thresholds = defaultdict(set)
         _load_active_token()
         state.force_refresh.set()
         try:
@@ -614,7 +774,7 @@ def action_edit_thresholds(icon, item):
 def _make_switch_account(account_id: str):
     def _do(icon, item):
         accounts.set_active(account_id)
-        state.fired_thresholds = {"session": set(), "weekly": set()}
+        state.fired_thresholds = defaultdict(set)
         _load_active_token()
         state.force_refresh.set()
         _refresh_icon(icon)
@@ -624,7 +784,7 @@ def _make_switch_account(account_id: str):
 def _make_set_threshold_preset(preset: list[int]):
     def _do(icon, item):
         user_settings.update(thresholds=preset)
-        state.fired_thresholds = {"session": set(), "weekly": set()}
+        state.fired_thresholds = defaultdict(set)
         _refresh_icon(icon)
     return _do
 
@@ -639,6 +799,17 @@ def _make_set_theme(value: str):
 def _make_set_icon_style(value: str):
     def _do(icon, item):
         user_settings.update(icon_style=value)
+        _refresh_icon(icon)
+    return _do
+
+
+def _make_set_metric(value: str):
+    """Point this icon at a bucket ("auto" = whichever is closest to full)."""
+    def _do(icon, item):
+        user_settings.update(headline_metric=value)
+        if getattr(icon, "metric_override", None) is not None:
+            icon.metric_override = value
+        state.force_refresh.set()
         _refresh_icon(icon)
     return _do
 
@@ -744,24 +915,22 @@ action_toggle_window_attribution = _make_bool_toggle("attribute_active_window", 
 # --- Menu construction ----------------------------------------------------
 
 def build_menu(metric: str = "session"):
+    metric = _normalize_metric(metric)
     return pystray.Menu(
         pystray.MenuItem(
             lambda item: _menu_headline_text(metric),
             None,
             enabled=False,
         ),
-        pystray.MenuItem(
-            lambda item: _menu_session_text(),
-            None,
-            enabled=False,
-            visible=lambda item: bool(_menu_session_text()),
-        ),
-        pystray.MenuItem(
-            lambda item: _menu_weekly_text(),
-            None,
-            enabled=False,
-            visible=lambda item: bool(_menu_weekly_text()),
-        ),
+        *[
+            pystray.MenuItem(
+                lambda item, i=slot: _menu_claim_text(i),
+                None,
+                enabled=False,
+                visible=lambda item, i=slot: bool(_menu_claim_text(i)),
+            )
+            for slot in range(_MAX_CLAIM_ROWS)
+        ],
         pystray.MenuItem(
             lambda item: _menu_burn_text(),
             None,
@@ -794,7 +963,7 @@ def build_menu(metric: str = "session"):
         ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(t('menu.account'), _build_account_menu()),
-        pystray.MenuItem(t('menu.settings'), _build_settings_menu()),
+        pystray.MenuItem(t('menu.settings'), _build_settings_menu(metric)),
         pystray.MenuItem(t('menu.open_console'), _build_console_menu()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Powered by KPWebappStudio", action_open_repo),
@@ -819,7 +988,28 @@ def _build_account_menu():
     return pystray.Menu(*items)
 
 
-def _build_settings_menu():
+def _build_bucket_menu(metric: str):
+    """Radio list of the buckets this icon can display."""
+    items = [
+        pystray.MenuItem(
+            t('menu.bucket_auto'),
+            _make_set_metric("auto"),
+            checked=lambda item: metric == "auto",
+            radio=True,
+        ),
+        pystray.Menu.SEPARATOR,
+    ]
+    for key in _available_metrics():
+        items.append(pystray.MenuItem(
+            claim_label(key),
+            _make_set_metric(key),
+            checked=lambda item, k=key: metric == k,
+            radio=True,
+        ))
+    return pystray.Menu(*items)
+
+
+def _build_settings_menu(metric: str = "session"):
     cur_thresholds = _thresholds()
     presets = [
         (t('menu.thresholds_quiet'), [95]),
@@ -875,11 +1065,13 @@ def _build_settings_menu():
             checked=lambda item, s=seconds: s == cur_interval,
             radio=True,
         )
+        # Floored at MIN_POLL_SECONDS while the usage endpoint is the source,
+        # so shorter presets would be silently clamped.
         for label, seconds in (
-            (t('menu.interval_30s'), 30),
-            (t('menu.interval_1m'), 60),
-            (t('menu.interval_2m'), 120),
+            (t('menu.interval_3m'), 180),
             (t('menu.interval_5m'), 300),
+            (t('menu.interval_10m'), 600),
+            (t('menu.interval_30m'), 1800),
         )
     ]
 
@@ -942,6 +1134,7 @@ def _build_settings_menu():
             action_toggle_window_attribution,
             checked=lambda item: bool(user_settings.get("attribute_active_window", False)),
         ),
+        pystray.MenuItem(t('menu.icon_bucket'), _build_bucket_menu(metric)),
         pystray.MenuItem(t('menu.icon_theme'), pystray.Menu(*theme_items)),
         pystray.MenuItem(t('menu.icon_style'), pystray.Menu(*style_items)),
         pystray.MenuItem(t('menu.poll_interval'),
@@ -957,6 +1150,11 @@ def _build_console_menu():
     )
 
 
+# Bar rows the menu reserves for buckets. Plans expose at most a handful
+# (5h, weekly, and one per model family); extra ones fall off the list.
+_MAX_CLAIM_ROWS = 6
+
+
 def _menu_headline_text(metric: str = "session") -> str:
     snap = state.snapshot
     if state.token_error:
@@ -970,43 +1168,44 @@ def _menu_headline_text(metric: str = "session") -> str:
     if not snap.ok:
         return t('status.api_error')
     name = state.active_account["name"] if state.active_account else config.APP_NAME
-    tag = "[Week]" if metric == "weekly" else "[5h]"
+    headline = state.headline_claim_for(_normalize_metric(metric))
+    tag = f"[{_compact_label(headline)}]" if headline else "[5h]"
+    parts = [f"● {tag} {name}"]
     if state.plan:
-        return f"● {tag} {name} · {state.plan}"
-    return f"● {tag} {name}"
+        parts.append(state.plan)
+    if snap.source == "headers":
+        parts.append(t('status.header_fallback'))
+    return " · ".join(parts)
 
 
-def _menu_session_text() -> str:
+def _menu_claim_text(slot: int) -> str:
+    """One bar row per bucket. Slots beyond the current bucket count stay blank."""
     snap = state.snapshot
-    if not snap or not snap.ok or snap.session_pct is None:
+    if not snap or not snap.ok:
         return ""
-    pct = snap.session_pct
-    return (
-        f"{color_emoji(pct)} {t('bar.session_short')}  {unicode_bar(pct)}  {pct:>3}%  "
-        f"· {t('bar.resets_in', time=format_reset(snap.session_reset_seconds))}"
-    )
-
-
-def _menu_weekly_text() -> str:
-    snap = state.snapshot
-    if not snap or not snap.ok or snap.weekly_pct is None:
+    rows = snap.ordered_claims()
+    if slot >= len(rows):
         return ""
-    pct = snap.weekly_pct
-    return (
-        f"{color_emoji(pct)} {t('bar.weekly_short')}  {unicode_bar(pct)}  {pct:>3}%  "
-        f"· {t('bar.resets_in', time=format_reset(snap.weekly_reset_seconds))}"
+    claim = rows[slot]
+    pct = claim.pct
+    text = (
+        f"{color_emoji(pct)} {_label(claim)}  {unicode_bar(pct)}  {pct:>3}%  "
+        f"· {t('bar.resets_in', time=format_reset(claim.reset_seconds))}"
     )
+    if claim.cap_fraction:
+        text += f" · {t('bar.cap_note', pct=int(claim.cap_fraction * 100))}"
+    return text
 
 
 def _menu_burn_text() -> str:
     bits = []
-    for key, label in (("session", t('bar.session_short')),
-                       (
-                       "weekly", t('bar.weekly_short'))):
+    for key in _live_claim_keys():
+        label = claim_label(key)
         info = state.burn.get(key, {})
         rate = info.get("rate")
         eta = info.get("eta_seconds")
-        if rate is None:
+        # Flat buckets say nothing useful and there are several of them now.
+        if rate is None or rate <= 0.05:
             continue
         if eta is not None:
             bits.append(f"{label}: +{rate:.0f}%/h → {format_reset(eta)}")
@@ -1069,8 +1268,12 @@ def _start_heartbeat_thread() -> None:
     """
     # If the poll loop hasn't ticked in this long, treat it as wedged and
     # stop refreshing the heartbeat so the external watchdog restarts us.
-    # Must exceed the largest poll interval (300s) plus margin.
-    WEDGE_THRESHOLD_SECONDS = 600
+    # Must stay above the configured poll interval, which the bucket work
+    # raised as high as 30 minutes — a slow interval is not a wedge.
+    def _wedge_threshold() -> int:
+        interval = int(user_settings.get("poll_interval_seconds",
+                                         config.POLL_INTERVAL_SECONDS))
+        return max(600, interval * 2 + 120)
 
     def _beat():
         hb = user_settings.SETTINGS_DIR / "tray.heartbeat"
@@ -1080,7 +1283,7 @@ def _start_heartbeat_thread() -> None:
             pass
         while not state.stop.is_set():
             tick = state.last_loop_tick
-            poll_wedged = tick and (time.time() - tick) > WEDGE_THRESHOLD_SECONDS
+            poll_wedged = tick and (time.monotonic() - tick) > _wedge_threshold()
             if not poll_wedged:
                 try:
                     hb.touch(exist_ok=True)
@@ -1101,7 +1304,7 @@ def _make_icon(app_id: str, metric: str, style: Optional[str]) -> pystray.Icon:
         title=f"{config.APP_NAME}\nStarting…",
         menu=build_menu(metric),
     )
-    icon.metric_override = metric
+    icon.metric_override = _normalize_metric(metric)
     if style:
         icon.style_override = style
     return icon
@@ -1146,7 +1349,7 @@ def main():
 
     try:
         user_settings.load()
-        state.last_loop_tick = time.time()
+        state.last_loop_tick = time.monotonic()
         _start_heartbeat_thread()
         notifications.init(config.APP_NAME)
 

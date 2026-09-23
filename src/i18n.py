@@ -46,6 +46,7 @@ _T: dict[str, dict[str, str]] = {
         "status.fetching_tooltip": "Fetching…",
         "status.error_tooltip": "Error: {msg}",
         "status.no_headers": "No rate-limit headers in response.",
+        "status.header_fallback": "Per-model buckets unavailable — header fallback",
         "status.no_account": "No account configured.",
         "status.fetching_msg": "Fetching usage data…",
         "status.unknown_error": "Unknown error",
@@ -55,12 +56,32 @@ _T: dict[str, dict[str, str]] = {
         "bar.weekly_label": "Weekly limit",
         "bar.session_short": "5-hour",
         "bar.weekly_short": "Weekly",
+        "bar.window_one_hour": "1-hour",
+        "bar.window_one_day": "Daily",
+        "bar.window_thirty_day": "Monthly",
+        "bar.cap_note": "cap {pct}% of the window",
         "bar.no_data": "No data yet",
         "bar.resets_in": "resets in {time}",
         "bar.resets_unknown": "resets — unknown",
         "bar.burn_collecting": "Burn rate: collecting…",
         "bar.burn_full_in": "{label}: +{rate:.1f}%/h · full in {eta}",
         "bar.burn_no_eta": "{label}: +{rate:.1f}%/h",
+
+        # Duration units (rendered right next to the number)
+        "unit.s": "{n}s",
+        "unit.m": "{n}m",
+        "unit.h": "{n}h",
+        "unit.d": "{n}d",
+
+        # Flyout panel
+        "flyout.stale": "stale",
+        "flyout.paused": "⏸ paused",
+        "flyout.error": "⚠ error",
+        "flyout.hint": "Right-click for history & settings",
+        "flyout.verdict_full": "full in {eta}",
+        "flyout.verdict_safe": "safe · +{rate:.1f}%/h",
+        "flyout.verdict_rate": "+{rate:.1f}%/h",
+        "flyout.verdict_idle": "idle",
 
         # Notifications
         "toast.token_error_title": "{app} — Token error",
@@ -103,11 +124,16 @@ _T: dict[str, dict[str, str]] = {
         "menu.style_solid": "Solid",
         "menu.style_donut": "Donut",
         "menu.style_bar": "Bar",
+        "menu.icon_bucket": "Tray icon shows",
+        "menu.bucket_auto": "Busiest bucket",
         "menu.poll_interval": "Poll interval",
         "menu.interval_30s": "30 seconds",
         "menu.interval_1m": "1 minute",
         "menu.interval_2m": "2 minutes",
+        "menu.interval_3m": "3 minutes",
         "menu.interval_5m": "5 minutes",
+        "menu.interval_10m": "10 minutes",
+        "menu.interval_30m": "30 minutes",
         "menu.language": "Language",
         "menu.open_console": "Open Anthropic Console",
         "menu.console_usage": "Usage dashboard",
@@ -195,6 +221,7 @@ _T: dict[str, dict[str, str]] = {
         "status.fetching_tooltip": "กำลังโหลด…",
         "status.error_tooltip": "ผิดพลาด: {msg}",
         "status.no_headers": "ไม่พบ rate-limit headers จาก response",
+        "status.header_fallback": "ไม่ได้ข้อมูลแยกโมเดล — ใช้ค่าจาก header แทน",
         "status.no_account": "ยังไม่ได้ตั้งค่าบัญชี",
         "status.fetching_msg": "กำลังโหลดข้อมูลโควต้า…",
         "status.unknown_error": "ผิดพลาดไม่ทราบสาเหตุ",
@@ -204,12 +231,32 @@ _T: dict[str, dict[str, str]] = {
         "bar.weekly_label": "ลิมิตรายสัปดาห์",
         "bar.session_short": "5 ชม.",
         "bar.weekly_short": "รายสัปดาห์",
+        "bar.window_one_hour": "1 ชม.",
+        "bar.window_one_day": "รายวัน",
+        "bar.window_thirty_day": "รายเดือน",
+        "bar.cap_note": "เพดาน {pct}% ของรอบนี้",
         "bar.no_data": "ยังไม่มีข้อมูล",
         "bar.resets_in": "รีเซ็ตในอีก {time}",
         "bar.resets_unknown": "รีเซ็ต — ไม่ทราบเวลา",
         "bar.burn_collecting": "อัตราการใช้: กำลังเก็บข้อมูล…",
         "bar.burn_full_in": "{label}: +{rate:.1f}%/ชม. · เต็มในอีก {eta}",
         "bar.burn_no_eta": "{label}: +{rate:.1f}%/ชม.",
+
+        # Duration units (rendered right next to the number)
+        "unit.s": "{n} วิ",
+        "unit.m": "{n} น.",
+        "unit.h": "{n} ชม.",
+        "unit.d": "{n} วัน",
+
+        # Flyout panel
+        "flyout.stale": "ข้อมูลเก่า",
+        "flyout.paused": "⏸ หยุดชั่วคราว",
+        "flyout.error": "⚠ ผิดพลาด",
+        "flyout.hint": "คลิกขวาเพื่อดูประวัติและตั้งค่า",
+        "flyout.verdict_full": "เต็มในอีก {eta}",
+        "flyout.verdict_safe": "ทันรีเซ็ต · +{rate:.1f}%/ชม.",
+        "flyout.verdict_rate": "+{rate:.1f}%/ชม.",
+        "flyout.verdict_idle": "ยังไม่ได้ใช้",
 
         # Notifications
         "toast.token_error_title": "{app} — ไม่พบ Token",
@@ -252,11 +299,16 @@ _T: dict[str, dict[str, str]] = {
         "menu.style_solid": "ทึบ",
         "menu.style_donut": "โดนัท",
         "menu.style_bar": "แถบ",
+        "menu.icon_bucket": "ไอคอนแสดงค่า",
+        "menu.bucket_auto": "ตัวที่ใกล้เต็มที่สุด",
         "menu.poll_interval": "ความถี่ในการเช็ค",
         "menu.interval_30s": "30 วินาที",
         "menu.interval_1m": "1 นาที",
         "menu.interval_2m": "2 นาที",
+        "menu.interval_3m": "3 นาที",
         "menu.interval_5m": "5 นาที",
+        "menu.interval_10m": "10 นาที",
+        "menu.interval_30m": "30 นาที",
         "menu.language": "ภาษา",
         "menu.open_console": "เปิด Anthropic Console",
         "menu.console_usage": "Dashboard การใช้งาน",
@@ -341,6 +393,30 @@ def set_language(lang: str) -> None:
     if lang not in _T:
         return
     user_settings.update(language=lang)
+
+
+_WINDOW_KEYS = {
+    "five_hour": "bar.session_short",
+    "seven_day": "bar.weekly_short",
+    "one_hour": "bar.window_one_hour",
+    "one_day": "bar.window_one_day",
+    "thirty_day": "bar.window_thirty_day",
+}
+
+
+def claim_label(key: str, display_name: str | None = None) -> str:
+    """Translated label for a quota bucket, e.g. 'Weekly · Opus'.
+
+    The window name is translated; the scope name is whatever the server
+    called it, so a model family Claude has never heard of still reads right.
+    """
+    import claims as _claims
+
+    window, model = _claims.split_key(_claims.normalize_key(key))
+    window_label = t(_WINDOW_KEYS[window]) if window in _WINDOW_KEYS \
+        else window.replace("_", " ").title()
+    suffix = display_name or (_claims.model_label(model) if model else None)
+    return f"{window_label} · {suffix}" if suffix else window_label
 
 
 def t(key: str, **kwargs: Any) -> str:

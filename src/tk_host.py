@@ -3,7 +3,7 @@ Process-wide Tk host.
 
 Owns the ONE tk.Tk() interpreter that lives for the lifetime of the
 process and runs its mainloop on the main thread. All popup windows
-(status_window, history_window, settings_dialogs) must be created as
+(flyout, history_window, settings_dialogs) must be created as
 ``tk.Toplevel(tk_host.root())`` and must schedule their construction
 via ``tk_host.spawn(builder)`` so the call happens on the Tk thread.
 
@@ -28,6 +28,8 @@ import tkinter as tk
 import traceback
 from typing import Callable, Optional
 
+import dpi
+
 
 _root: Optional[tk.Tk] = None
 _stop_requested = False
@@ -42,9 +44,21 @@ def ensure() -> tk.Tk:
     global _root
     if _root is not None:
         return _root
+    # Must happen before the interpreter exists: Tk reads the scaling once,
+    # at creation, and never revisits it.
+    dpi.enable()
     r = tk.Tk()
     r.withdraw()
     r.title("")
+    # pythonw.exe is per-monitor aware by manifest, so Tk starts believing the
+    # screen is 96 DPI no matter what enable() did; this is where that gets
+    # corrected, before any window is built against it.
+    dpi.sync_tk_scaling(r)
+    try:
+        import settings as user_settings
+        dpi.assert_landed(r, user_settings.SETTINGS_DIR / "error.log")
+    except Exception:
+        pass
     # The root is intentionally hidden — closing it would tear down the
     # whole Tk subsystem, so swallow the WM_DELETE_WINDOW protocol.
     r.protocol("WM_DELETE_WINDOW", lambda: None)

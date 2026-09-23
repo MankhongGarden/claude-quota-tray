@@ -17,6 +17,7 @@ from tkinter import filedialog, messagebox
 from typing import Callable, Optional
 
 import accounts
+import dpi
 import settings as user_settings
 import tk_host
 from bar_widget import ui_font
@@ -32,6 +33,28 @@ _BTN_BG_ACTIVE = "#3a3a3a"
 _ENTRY_BG = "#262626"
 
 _open_dialogs: dict[str, tk.Toplevel] = {}
+
+
+def _fit(win: tk.Toplevel, min_w: int, min_h: int) -> None:
+    """Size a dialog to its content, never below the hand-picked minimum.
+
+    The fixed sizes these replaced were written for a 96-DPI screen and cut
+    their own text off once the process became DPI aware — and the schedule
+    dialog was already clipping its description before that.
+    """
+    def _apply(again: bool = False) -> None:
+        try:
+            win.update_idletasks()
+            width = max(win.winfo_reqwidth(), int(round(min_w * dpi.scale(win))))
+            height = max(win.winfo_reqheight(), int(round(min_h * dpi.scale(win))))
+            win.geometry(f"{width}x{height}")
+            if not again:
+                # The first pass measures a layout that is still settling.
+                win.after(60, lambda: _apply(True))
+        except tk.TclError:
+            pass
+
+    _apply()
 
 
 def _spawn(kind: str, builder: Callable[[tk.Toplevel], None]) -> None:
@@ -104,7 +127,7 @@ def open_accounts(on_saved: Callable[[], None]) -> None:
 
 def _build_accounts(root: tk.Toplevel, on_saved: Callable[[], None]) -> None:
     root.title(t('dialog.accounts_title'))
-    root.geometry("560x420")
+    _fit(root, 560, 420)
 
     _label(root, t('dialog.accounts_heading'),
            font=ui_font(12, "bold")).pack(anchor="w", padx=16, pady=(14, 4))
@@ -203,7 +226,7 @@ def _open_add_account(parent: tk.Toplevel, on_added: Callable[[], None],
     dlg = tk.Toplevel(parent)
     dlg.title(t('dialog.accounts_add_title'))
     dlg.configure(bg=_BG)
-    dlg.geometry("520x260")
+    _fit(dlg, 520, 260)
     dlg.transient(parent)
     dlg.grab_set()
 
@@ -272,7 +295,7 @@ def _prompt_string(parent: tk.Toplevel, title: str, label: str,
     dlg = tk.Toplevel(parent)
     dlg.title(title)
     dlg.configure(bg=_BG)
-    dlg.geometry("360x150")
+    _fit(dlg, 360, 150)
     dlg.transient(parent)
     dlg.grab_set()
 
@@ -314,7 +337,7 @@ def open_schedule(on_saved: Callable[[], None]) -> None:
 
 def _build_schedule(root: tk.Toplevel, on_saved: Callable[[], None]) -> None:
     root.title(t('dialog.schedule_title'))
-    root.geometry("440x360")
+    _fit(root, 440, 360)
 
     sched = dict(user_settings.get("schedule", {}) or {})
 
@@ -399,7 +422,7 @@ def open_thresholds(on_saved: Callable[[], None]) -> None:
 
 def _build_thresholds(root: tk.Toplevel, on_saved: Callable[[], None]) -> None:
     root.title(t('dialog.thresholds_title'))
-    root.geometry("420x260")
+    _fit(root, 420, 260)
 
     cur = user_settings.get("thresholds", [80, 95])
 

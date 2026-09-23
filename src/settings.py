@@ -44,8 +44,12 @@ def _defaults() -> Dict[str, Any]:
         },
         "theme": "auto",  # "auto" | "light" | "dark"
         "icon_style": "frame",  # "frame" | "solid" | "donut" | "bar"
-        "headline_metric": "session",  # "session" (5h) | "weekly" (7d) — which figure the tray icon shows
-        "poll_interval_seconds": 60,
+        # Bucket the tray icon shows: a claim key ("five_hour", "seven_day",
+        # "seven_day_opus", ...), "auto" for whichever bucket is closest to
+        # full, or the legacy "session" / "weekly" names.
+        "headline_metric": "session",
+        # The usage endpoint 429s below ~180s, so polls are floored there.
+        "poll_interval_seconds": 180,
         "history_retention_days": 7,
         "language": None,  # None → auto-detect from locale on first read
         "pause_on_battery": True,  # skip polls while laptop runs on battery
