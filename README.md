@@ -10,10 +10,16 @@
 > Branches in this fork:
 > - **`main`** — mirrors upstream; do not modify here
 > - **[`fix/stale-token-refresh`](https://github.com/MankhongGarden/claude-quota-tray/tree/fix/stale-token-refresh)** — single bug fix proposed back to upstream as [PR #4](https://github.com/kpcrmv4/claude-quota-tray/pull/4)
-> - **`local-enhancements`** — personal feature stack (see "Fork additions" below);
->   not yet proposed upstream — waiting for author engagement on the open issues
->   ([#1](https://github.com/kpcrmv4/claude-quota-tray/issues/1) · [#3](https://github.com/kpcrmv4/claude-quota-tray/issues/3) · [#5](https://github.com/kpcrmv4/claude-quota-tray/issues/5))
->   before drip-feeding individual PRs.
+> - **`local-enhancements`** — personal feature stack (see "Fork additions" below),
+>   developed here rather than upstream. Three reports were filed on 2026-05-20
+>   ([#3](https://github.com/kpcrmv4/claude-quota-tray/issues/3) ·
+>   [#5](https://github.com/kpcrmv4/claude-quota-tray/issues/5) ·
+>   [PR #4](https://github.com/kpcrmv4/claude-quota-tray/pull/4)) and none has had
+>   a reply in four months, though upstream has shipped twice in that window
+>   (v0.3.0 in June, v0.4.0 in August) — including its own fix for #3, written
+>   independently. #5 (the `Tcl_Panic` crash from a worker-thread `tk.Tk()`) is
+>   still present in upstream `main`. This branch therefore stands on its own;
+>   individual fixes remain available to upstream on request.
 >
 > License stays MIT — same as upstream. Original `LICENSE` file preserved unchanged.
 
