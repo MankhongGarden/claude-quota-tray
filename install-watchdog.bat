@@ -4,15 +4,23 @@ REM every 5 minutes. Restarts any dead tray instance silently.
 
 set "TASK_NAME=ClaudeQuotaTrayWatchdog"
 set "SCRIPT=%~dp0watchdog.ps1"
+set "LAUNCHER=%~dp0watchdog-hidden.vbs"
 
 if not exist "%SCRIPT%" (
     echo ERROR: watchdog.ps1 not found at %SCRIPT%
     exit /b 1
 )
+if not exist "%LAUNCHER%" (
+    echo ERROR: watchdog-hidden.vbs not found at %LAUNCHER%
+    exit /b 1
+)
 
-REM Quote the script path (handles spaces in the parent directory).
+REM Launch through wscript rather than powershell.exe directly: the task runs
+REM in an interactive session, so -WindowStyle Hidden still flashes a console
+REM for an instant every five minutes. wscript starts the host hidden.
+REM Paths are quoted (escaped for schtasks) to survive spaces in the folder.
 schtasks /create /tn "%TASK_NAME%" ^
-    /tr "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"%SCRIPT%\"" ^
+    /tr "wscript.exe \"%LAUNCHER%\"" ^
     /sc minute /mo 5 ^
     /st 00:00 ^
     /rl LIMITED ^
