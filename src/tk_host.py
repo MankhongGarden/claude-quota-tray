@@ -50,9 +50,8 @@ def ensure() -> tk.Tk:
     r = tk.Tk()
     r.withdraw()
     r.title("")
-    # pythonw.exe is per-monitor aware by manifest, so Tk starts believing the
-    # screen is 96 DPI no matter what enable() did; this is where that gets
-    # corrected, before any window is built against it.
+    # Safety net: if enable() did not land before this point, Tk is holding
+    # the 96-DPI default and every later window would be built against it.
     dpi.sync_tk_scaling(r)
     try:
         import settings as user_settings

@@ -9,13 +9,16 @@ bitmap-stretches its windows, which is why the panels used to look soft on a
 success and Win32 metrics do change, but the Tk interpreter has already
 cached the old scaling: the UI comes out crisp and ~20% too small, silently.
 
-It asks for system awareness, but pythonw.exe already declares per-monitor
-awareness in its manifest, in which case the request is refused and the
-process stays per-monitor aware. That is the harder case: Tk starts before
-any window exists, sees 96 DPI and never revisits it, so `scale()` asks the
-display directly and `sync_tk_scaling()` corrects the interpreter once the
-root exists. Tk 8.6 has no WM_DPICHANGED handling, so a window dragged to a
-monitor at another scale keeps the scale it was built with.
+Measured on this machine (python.exe and pythonw.exe, Python 3.13): both
+start DPI-unaware, `SetProcessDpiAwareness(1)` succeeds, and Tk then reports
+the real 120 DPI. So the normal path is simply "enable, then build the root".
+`window_dpi()` and `sync_tk_scaling()` are belt-and-braces for the case where
+that ordering is broken or the process was made aware some other way (a
+manifest, a host launcher) and Tk settled on 96 before any window existed.
+
+Tk 8.6 has no WM_DPICHANGED handling, so a window dragged to a monitor at
+another scale keeps the scale it was built with; system awareness is the
+softer failure and is what `enable()` asks for.
 """
 
 from __future__ import annotations
@@ -52,10 +55,10 @@ def enable() -> bool:
 def window_dpi(win) -> Optional[int]:
     """The DPI of the display `win` is on, or None if Windows cannot say.
 
-    GetDpiForWindow answers 96 in an unaware process (which is the honest
-    answer there — the DWM will stretch the result) and the real monitor DPI
-    otherwise, including in a per-monitor-aware process where Tk itself still
-    believes it is at 96.
+    GetDpiForWindow answers 96 in an unaware process (the honest answer there
+    — the DWM will stretch the result) and the real monitor DPI otherwise.
+    It is the second opinion `scale()` uses when Tk's own number looks like
+    the 96-DPI default.
     """
     try:
         user32 = ctypes.windll.user32
@@ -77,10 +80,11 @@ def scale(win) -> float:
     Device pixels per logical pixel for `win`.
 
     The larger of what Tk believes and what the display reports. Tk reads the
-    DPI once, when the interpreter starts: a process that is per-monitor aware
-    (pythonw.exe declares this in its manifest) has no window at that moment,
-    so Tk settles on 96 and every hand-computed layout would come out ~20%
-    too small while looking perfectly crisp.
+    DPI once, when the interpreter starts, and never revisits it: if anything
+    made the process aware after that point, Tk would still say 96 and every
+    hand-computed layout would come out ~20% too small while looking perfectly
+    crisp. Asking the display as well costs nothing and removes that class of
+    silent failure.
     """
     best = 1.0
     try:
@@ -98,7 +102,8 @@ def sync_tk_scaling(root) -> float:
     Teach Tk the real DPI, so point-sized fonts and paddings match.
 
     Tk sizes fonts given in points against its own idea of the screen DPI.
-    Left at 96 in a per-monitor-aware process, every dialog renders small.
+    Left at 96 while the display is really at 120, every dialog renders small.
+    A no-op when Tk already agrees with the display, which is the normal case.
     Returns the scale that is now in effect.
     """
     factor = scale(root)
