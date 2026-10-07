@@ -8,9 +8,7 @@
 > ([KPWebappStudio](https://github.com/kpcrmv4/claude-quota-tray)).
 >
 > Branches in this fork:
-> - **`main`** — mirrors upstream; do not modify here
-> - **[`fix/stale-token-refresh`](https://github.com/MankhongGarden/claude-quota-tray/tree/fix/stale-token-refresh)** — single bug fix proposed back to upstream as [PR #4](https://github.com/kpcrmv4/claude-quota-tray/pull/4)
-> - **`local-enhancements`** — personal feature stack (see "Fork additions" below),
+> - **`local-enhancements`** (default) — personal feature stack (see "Fork additions" below),
 >   developed here rather than upstream. Three reports were filed on 2026-05-20
 >   ([#3](https://github.com/kpcrmv4/claude-quota-tray/issues/3) ·
 >   [#5](https://github.com/kpcrmv4/claude-quota-tray/issues/5) ·
@@ -20,6 +18,15 @@
 >   independently. #5 (the `Tcl_Panic` crash from a worker-thread `tk.Tk()`) is
 >   still present in upstream `main`. This branch therefore stands on its own;
 >   individual fixes remain available to upstream on request.
+> - **`main`** — the upstream copy as of v0.2.0 (May 2026); not updated here
+> - **[`fix/stale-token-refresh`](https://github.com/MankhongGarden/claude-quota-tray/tree/fix/stale-token-refresh)** — the 401 fix sent as [PR #4](https://github.com/kpcrmv4/claude-quota-tray/pull/4), closed on 2026-09-23 after upstream shipped its own version in `4ca290e` (v0.3.0)
+>
+> **Why upstream v0.3.0 / v0.4.0 is not merged in:** both releases fix bugs this
+> branch had already fixed its own way — v0.3.0 re-reads a rotated OAuth token on
+> 401 (item 1 below), v0.4.0 stops picking an MCP server's token instead of the
+> Claude one (item 12). Merging would conflict in `token_reader.py`, `api_client.py`
+> and `main.py` without adding a fix this branch lacks. The upstream Restart menu
+> item is the one thing not carried over.
 >
 > License stays MIT — same as upstream. Original `LICENSE` file preserved unchanged.
 
@@ -27,7 +34,8 @@
 
 1. **Stale-token survival** — re-read OAuth credentials on 401/403 so the tray
    doesn't silently die after Claude Code rotates the access token
-   ([PR #4](https://github.com/kpcrmv4/claude-quota-tray/pull/4))
+   ([PR #4](https://github.com/kpcrmv4/claude-quota-tray/pull/4); upstream fixed
+   the same thing independently in v0.3.0)
 2. **Single-Tk-root refactor + heartbeat watchdog** — one `tk.Tk()` per process
    on the main thread, popups as `Toplevel(root)`, pystray on a worker thread.
    Kills the silent `Tcl_Panic` in `tcl86t.dll` that the prior worker-thread
@@ -54,6 +62,16 @@
     account-wide ones; buckets are generic, so a new one needs no code change.
     Any icon can be pointed at any bucket (or at whichever is closest to full),
     and the header method stays as an automatic fallback.
+12. **Right token, wedge detection** — the token reader takes
+    `claudeAiOauth.accessToken` and skips MCP OAuth tokens (a connected MCP server
+    used to win the recursive search and every poll got 401). The heartbeat stops
+    when the poll loop hasn't ticked for 10 minutes, so the watchdog restarts a
+    wedged tray instead of trusting a live-but-stuck process.
+13. **Borderless flyout** — left-click opens a small rounded panel instead of
+    the old titled status window; it closes on focus loss, Escape or a second click.
+14. **Single-instance lock** — a second launch against the same data dir exits
+    instead of drawing a duplicate icon (sent upstream as
+    [PR #6](https://github.com/kpcrmv4/claude-quota-tray/pull/6)).
 
 Each item is opt-in via either a `settings.json` key, env var, or right-click
 menu toggle. Defaults preserve original single-icon, schedule-paused, non-aggregate
